@@ -1,0 +1,47 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+__MACOSX/
+
+# Runtime workspace artifacts (keep directory structure via .gitkeep)
+workspace/Inputs/**
+!workspace/Inputs/uploads/.gitkeep
+!workspace/Inputs/raw/.gitkeep
+workspace/Planning/**
+!workspace/Planning/.gitkeep
+workspace/Survey/**
+!workspace/Survey/.gitkeep
+workspace/Innovation/**
+!workspace/Innovation/.gitkeep
+workspace/Assessment/**
+!workspace/Assessment/.gitkeep
+workspace/Outputs/**
+!workspace/Outputs/.gitkeep
+workspace/History/**
+!workspace/History/.gitkeep
+
+global_context.json
