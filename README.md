@@ -229,23 +229,6 @@ Runtime artifacts under `workspace/` are git-ignored by default (except `.gitkee
 
 ---
 
-## Skills
-
-Skills live in `Skills/<name>/SKILL.md` and follow the [Agent Skills](https://docs.langchain.com/oss/python/deepagents/skills) convention (YAML frontmatter + markdown instructions).
-
-| Skill | Purpose |
-|-------|---------|
-| `deep-research` | Multi-angle web research methodology |
-| `deep-search` | Structured search strategies |
-| `survey-report` | Survey report formatting |
-| `report-formatting` | Final report structure |
-| `google-scholar-search` | Scholar-oriented search guidance |
-| `pdf` | PDF handling instructions |
-
-Agents load skills automatically via Deep Agents progressive disclosure.
-
----
-
 ## Project Structure
 
 ```
