@@ -1,6 +1,6 @@
 # OmniIDEA
 
-**OmniIDEA** is a multi-agent research workflow for turning open-ended research questions into structured literature surveys, research ideas, critical assessments, and final reports. It combines [LangGraph](https://github.com/langchain-ai/langgraph) orchestration with [Deep Agents](https://github.com/langchain-ai/deepagents) and a skill-based tool layer for web search, PDF extraction, and workspace file management.
+**OmniIDEA** is a multi-agent research workflow for turning open-ended research questions into structured literature surveys, research ideas, critical assessments, and final reports.
 
 The pipeline is designed for **human-in-the-loop** research: you can steer each phase, request re-runs, upload references, or switch to fully automatic mode when you prefer minimal interaction.
 
