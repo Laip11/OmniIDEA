@@ -6,23 +6,25 @@ Workspace 目录结构：
 │   ├── uploads/              # 用户上传的原始文件
 │   └── raw/                  # 收集到的文献/内容缓存
 ├── Planning/
-│   ├── task_breakdown.json
+│   ├── search_plan.md
 │   ├── global_context.json
 │   └── human_feedback_plan.md
 ├── Survey/
-│   ├── surveyed.md
 │   ├── report.md
 │   └── human_feedback_survey.md
 ├── Innovation/
 │   ├── ideas.md
-│   ├── consolidated.md
 │   └── human_feedback_idea.md
 ├── Assessment/
-│   ├── assessment_results.json
+│   ├── rubric.md
+│   ├── rubric_dimensions.json    # Rubric 源数据（自适应维度）
+│   ├── assessment_feedback.md
+│   ├── iteration_history.md      # Idea↔Assessment 各轮反馈归档
 │   └── human_feedback_eval.md
-└── Outputs/
-    ├── draft.md
-    └── Final_Report.md
+├── Outputs/
+│   └── Final_Report.md
+└── History/
+    └── version_*.json            # 运行时版本快照
 
 Skills 目录（位于 workspace 外部，与 workspace 同级）：
 Skills/
@@ -40,6 +42,8 @@ import re
 import json
 from typing import Optional, Any, Dict, List
 from langgraph.store.memory import InMemoryStore
+
+import cli
 
 
 # ==========================================
@@ -70,8 +74,10 @@ INNOVATION_IDEAS = "Innovation/ideas.md"
 INNOVATION_HUMAN_FEEDBACK = "Innovation/human_feedback_idea.md"
 
 ASSESSMENT_RUBRIC = "Assessment/rubric.md"
-ASSESSMENT_RESULTS = "Assessment/assessment_results.json"
+# Rubric source data (adaptive dimensions) — rubric.md is only a rendered view of this
+ASSESSMENT_RUBRIC_DIMENSIONS = "Assessment/rubric_dimensions.json"
 ASSESSMENT_FEEDBACK = "Assessment/assessment_feedback.md"
+ASSESSMENT_ITERATION_HISTORY = "Assessment/iteration_history.md"
 ASSESSMENT_HUMAN_FEEDBACK = "Assessment/human_feedback_eval.md"
 
 OUTPUTS_FINAL_REPORT = "Outputs/Final_Report.md"
@@ -102,8 +108,8 @@ class WorkspaceStore(InMemoryStore):
             full_path = os.path.join(self.workspace_dir, sub_dir)
             os.makedirs(full_path, exist_ok=True)
         os.makedirs(self.skills_dir, exist_ok=True)
-        print(f"   📁 Workspace 目录已就绪: {self.workspace_dir}")
-        print(f"   📁 Skills 目录已就绪: {self.skills_dir}")
+        cli.debug(f"Workspace ready: {self.workspace_dir}")
+        cli.debug(f"Skills dir ready: {self.skills_dir}")
 
     def _resolve_path(self, namespace: tuple, key: str) -> str:
         """
@@ -112,8 +118,8 @@ class WorkspaceStore(InMemoryStore):
         支持两种调用方式：
         1. namespace=("Planning",), key="task_breakdown.json"
            -> workspace/Planning/task_breakdown.json
-        2. namespace=("Inputs", "raw"), key="collected_papers.md"
-           -> workspace/Inputs/raw/collected_papers.md
+        2. namespace=("Inputs", "raw"), key="pdf_cache/paper.txt"
+           -> workspace/Inputs/raw/pdf_cache/paper.txt
         """
         clean_key = key.lstrip("/")
         if clean_key.startswith("workspace/"):
@@ -158,10 +164,10 @@ class WorkspaceStore(InMemoryStore):
                     super().put(namespace, key, {"content": content})
                     loaded_count += 1
                 except Exception as error:
-                    print(f"   ⚠️ 加载文件失败 {file_path}: {error}")
+                    cli.warn(f"Failed to load {file_path}: {error}")
 
         if loaded_count > 0:
-            print(f"   📂 已加载 {loaded_count} 个文件到内存")
+            cli.debug(f"Loaded {loaded_count} file(s) into memory")
 
     def put(self, namespace: tuple, key: str, value: Any, index: Optional[bool] = None) -> None:
         """存储数据，同时同步到 workspace 文件"""
@@ -195,9 +201,9 @@ class WorkspaceStore(InMemoryStore):
             with open(local_path, "w", encoding="utf-8") as file_handle:
                 file_handle.write(content_str)
 
-            print(f"   💾 已写入: {os.path.relpath(local_path, self.workspace_dir)}")
+            cli.debug(f"Synced: {os.path.relpath(local_path, self.workspace_dir)}")
         except Exception as error:
-            print(f"   ⚠️ 写入失败: {error}")
+            cli.warn(f"Write failed: {error}")
 
     def delete(self, namespace: tuple, key: str) -> None:
         """删除数据，同时删除 workspace 文件"""
@@ -206,9 +212,9 @@ class WorkspaceStore(InMemoryStore):
             local_path = self._resolve_path(namespace, key)
             if os.path.exists(local_path):
                 os.remove(local_path)
-                print(f"   🗑️ 已删除: {os.path.relpath(local_path, self.workspace_dir)}")
+                cli.debug(f"Deleted: {os.path.relpath(local_path, self.workspace_dir)}")
         except Exception as error:
-            print(f"   ⚠️ 删除失败: {error}")
+            cli.warn(f"Delete failed: {error}")
 
     def read_file(self, relative_path: str) -> Optional[str]:
         """
@@ -354,7 +360,7 @@ class WorkspaceStore(InMemoryStore):
         with open(version_file, "w", encoding="utf-8") as fh:
             json.dump(version_record, fh, ensure_ascii=False, indent=2)
 
-        print(f"   📸 Memory version {new_version} recorded (input_type={input_type}, phase={current_phase})")
+        cli.debug(f"Memory version {new_version} recorded (input_type={input_type}, phase={current_phase})")
         return new_version
 
     def list_versions(self) -> List[Dict[str, Any]]:
@@ -613,7 +619,7 @@ class WorkspaceStore(InMemoryStore):
                 skills_files[virtual_path] = create_file_data(content)
 
         if skills_files:
-            print(f"   📦 已构建 {len(skills_files)} 个 skill 文件用于 StateBackend 注入")
+            cli.debug(f"Built {len(skills_files)} skill file(s) for StateBackend injection")
 
         return skills_files
 

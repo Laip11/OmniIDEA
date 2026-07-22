@@ -19,7 +19,7 @@ from prompts import (
     PLANNING_AGENT_PROMPT,
     SURVEY_AGENT_PROMPT,
     IDEA_AGENT_PROMPT,
-    ASSESSMENT_AGENT_PROMPT,
+    ASSESSMENT_RUBRIC_AGENT_PROMPT,
     REPORT_AGENT_PROMPT
 )
 from tools import (
@@ -40,12 +40,16 @@ shared_store = create_workspace_store()
 # 将 shared_store 注入到 tools 模块，使 write_file tool 能同步更新内存状态
 set_shared_store(shared_store)
 
-def make_backend(runtime):
-    """定义后端路由"""
-    return CompositeBackend(
-        default=StateBackend(runtime),
-        routes={"/workspace/": StoreBackend(runtime)}
-    )
+# 后端路由（deepagents>=0.6 新写法）：直接实例化 BackendProtocol 而非 factory。
+# StateBackend 运行时经 get_config() 读写 state，StoreBackend 经 get_store() 获取 store，
+# 实例本身不绑定 runtime、无状态，可被所有 Agent 安全共享。
+# StoreBackend 必须显式传 namespace（0.7.0 起移除 legacy 的 assistant_id 探测）：
+# 本项目所有 Agent 共享同一 workspace 且调用时未传 assistant_id，
+# 固定 ("filesystem",) 与 legacy 探测的实际解析结果完全一致。
+workspace_backend = CompositeBackend(
+    default=StateBackend(),
+    routes={"/workspace/": StoreBackend(namespace=lambda _runtime: ("filesystem",))},
+)
 
 # ==========================================
 # LLM 配置 - 支持不同温度设置
@@ -145,7 +149,7 @@ def build_agent(name: str, role_prompt: str, tools=None, model=None,
     return create_deep_agent(
         model=model,
         store=shared_store,
-        backend=make_backend,
+        backend=workspace_backend,
         tools=tools,
         system_prompt=system_prompt,
         skills=skills,
@@ -172,10 +176,15 @@ idea_agent = build_agent(
     model=model_creative
 )
 
-# Assessment Agent (评估员) - 标准温度 + 文件读写
-assessment_agent = build_agent(
-    "Assessment Agent",
-    ASSESSMENT_AGENT_PROMPT,
+# 注意：Assessment Agent 不再拥有全局实例——它在 run_assessment_node 中按需构建，
+# 以便将当前 rubric.md 内容注入系统提示的 {rubric_content} 占位符。
+
+# Assessment Rubric Agent (评估标准设计专家) - 轻量角色，仅负责生成/写回 rubric
+# 与 Assessment Agent 分离：评估员的系统提示包含完整评估流程（含 MANDATORY 写 feedback），
+# 若复用它会驱动 Agent 在 rubric 步骤里把整轮评估都做完。
+assessment_rubric_agent = build_agent(
+    "Assessment Rubric Agent",
+    ASSESSMENT_RUBRIC_AGENT_PROMPT,
     tools=AGENT_BASE_TOOLS,
     model=model_standard
 )

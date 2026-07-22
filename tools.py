@@ -2,14 +2,16 @@ import os
 import re
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tavily import TavilyClient
 from typing import Annotated, List, Literal, Optional
 from langchain_core.tools import InjectedToolArg, tool
 
+import cli
+
 _tavily_api_key = os.getenv("TAVILY_API_KEY")
 if not _tavily_api_key:
-    print("⚠️ Warning: TAVILY_API_KEY environment variable is not set. Tavily search will not work.")
-    print("   Please set it: export TAVILY_API_KEY='your-api-key'")
+    cli.warn("TAVILY_API_KEY not set — Tavily search disabled (set it in .env to enable)")
     tavily_client = None
 else:
     tavily_client = TavilyClient(api_key=_tavily_api_key)
@@ -18,26 +20,8 @@ else:
 # 网络搜索（只返回摘要，不抓取完整内容）
 # ==========================================
 
-@tool(parse_docstring=True)
-def tavily_search(
-    query: str,
-    max_results: Annotated[int, InjectedToolArg] = 25,
-    topic: Annotated[
-        Literal["general", "news", "finance"], InjectedToolArg
-    ] = "general",
-) -> str:
-    """Search the web for information on a given query.
-
-    Returns search results with titles, URLs, and snippets. Use web_fetch to get full content of specific URLs.
-
-    Args:
-        query: Search query to execute
-        max_results: Maximum number of results to return (default: 10)
-        topic: Topic filter - 'general', 'news', or 'finance' (default: 'general')
-
-    Returns:
-        Formatted search results with titles, URLs, and snippets (not full content)
-    """
+def _execute_tavily_query(query: str, max_results: int = 25, topic: str = "general") -> str:
+    """执行单次 Tavily 搜索并格式化结果（单发/批量工具共用的私有实现）。"""
     search_results = tavily_client.search(
         query,
         max_results=max_results,
@@ -57,13 +41,90 @@ def tavily_search(
 """
         result_texts.append(result_text)
 
-    response = f"""🔍 Found {len(result_texts)} result(s) for '{query}':
+    return f"""🔍 Found {len(result_texts)} result(s) for '{query}':
 
-{chr(10).join(result_texts)}
+{chr(10).join(result_texts)}"""
 
-💡 **Tip:** Use `web_fetch(url)` to get full content of specific URLs that look most relevant."""
 
-    return response
+@tool(parse_docstring=True)
+def tavily_search(
+    query: str,
+    max_results: Annotated[int, InjectedToolArg] = 25,
+    topic: Annotated[
+        Literal["general", "news", "finance"], InjectedToolArg
+    ] = "general",
+) -> str:
+    """Search the web for information on a given query.
+
+    Returns search results with titles, URLs, and snippets. Use web_fetch to get full content of specific URLs.
+    When you have multiple INDEPENDENT queries, prefer batch_web_search (concurrent, faster).
+
+    Args:
+        query: Search query to execute
+        max_results: Maximum number of results to return (default: 10)
+        topic: Topic filter - 'general', 'news', or 'finance' (default: 'general')
+
+    Returns:
+        Formatted search results with titles, URLs, and snippets (not full content)
+    """
+    response = _execute_tavily_query(query, max_results=max_results, topic=topic)
+    return response + "\n\n💡 **Tip:** Use `web_fetch(url)` to get full content of specific URLs that look most relevant."
+
+
+_BATCH_MAX_QUERIES = 6
+
+
+@tool(parse_docstring=True)
+def batch_web_search(
+    queries: List[str],
+    max_results_per_query: Annotated[int, InjectedToolArg] = 8,
+) -> str:
+    """Run multiple INDEPENDENT web searches concurrently in a single call.
+
+    Prefer this over repeated `tavily_search` calls whenever you have several queries
+    that do NOT depend on each other's results (e.g., different angles of the same
+    research round): one call fires all queries in parallel and returns every result
+    set together, saving substantial wall-clock time. Use single `tavily_search` only
+    when the next query depends on a previous result.
+
+    Args:
+        queries: List of search queries to run concurrently (max 6 per call; extra queries are dropped)
+        max_results_per_query: Maximum number of results per query (default: 8)
+
+    Returns:
+        Search result sections grouped per query (titles, URLs, snippets, not full content)
+    """
+    if tavily_client is None:
+        return "Error: Tavily search is disabled (TAVILY_API_KEY not set)."
+
+    # 去重保序 + 防风暴截断
+    unique_queries = list(dict.fromkeys(q.strip() for q in queries if q and q.strip()))
+    if not unique_queries:
+        return "Error: no valid queries provided."
+    dropped = max(0, len(unique_queries) - _BATCH_MAX_QUERIES)
+    run_queries = unique_queries[:_BATCH_MAX_QUERIES]
+
+    def _safe_run(q: str):
+        try:
+            return q, _execute_tavily_query(q, max_results=max_results_per_query)
+        except Exception as exc:  # 错误隔离：单查询失败不影响整批
+            return q, f"⚠️ search failed: {exc}"
+
+    sections = {}
+    with ThreadPoolExecutor(max_workers=min(len(run_queries), _BATCH_MAX_QUERIES)) as pool:
+        futures = [pool.submit(_safe_run, q) for q in run_queries]
+        for fut in as_completed(futures):
+            q, text = fut.result()
+            sections[q] = text
+
+    header = f"🔍 Batch search: {len(run_queries)} queries executed concurrently"
+    if dropped:
+        header += f" (dropped {dropped} extra quer{'y' if dropped == 1 else 'ies'} — max {_BATCH_MAX_QUERIES} per call)"
+    parts = [f'## Query: "{q}"\n\n{sections[q]}' for q in run_queries]  # 按输入顺序输出
+    return (
+        header + "\n\n" + "\n\n".join(parts)
+        + "\n\n💡 **Tip:** Use `web_fetch(url)` to get full content of specific URLs that look most relevant."
+    )
 
 
 # pdf_extract_text 的返回值会作为 ToolMessage 进入对话；与 web_fetch 类似需限制长度，避免大 PDF 撑爆上下文。
@@ -94,7 +155,7 @@ def pdf_extract_text(
     Returns:
         Extracted text content with page markers, and optionally tables.
     """
-    print(f"📄 PDF Extract: {file_path}")
+    cli.tool("pdf_extract", file_path)
 
     if not os.path.isabs(file_path):
         workspace_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
@@ -142,9 +203,9 @@ def _cache_extracted_text(source_pdf_path: str, extracted_text: str) -> None:
         with open(cache_file_path, "w", encoding="utf-8") as cache_file:
             cache_file.write(extracted_text)
 
-        print(f"   💾 Cached to: Inputs/raw/pdf_cache/{pdf_basename}.txt")
+        cli.debug(f"PDF cache saved: Inputs/raw/pdf_cache/{pdf_basename}.txt")
     except Exception as error:
-        print(f"   ⚠️ Cache write failed: {error}")
+        cli.warn(f"Cache write failed: {error}")
 
 def _extract_with_pdfplumber(
     file_path: str,
@@ -280,15 +341,13 @@ def read_file(file_path: str) -> str:
     and any other files produced by other agents.
 
     Common paths:
-    - Planning/search_plan.md — search plan (needs analysis & retrieval tasks)
+    - Planning/search_plan.md — search plan
     - Planning/global_context.json — global context
-    - Inputs/raw/collected_papers.md — collected papers data
-    - Survey/surveyed.md — per-paper survey notes
     - Survey/report.md — survey summary report
     - Innovation/ideas.md — generated ideas
-    - Innovation/consolidated.md — consolidated ideas
-    - Assessment/assessment_results.json — assessment scores
-    - Outputs/draft.md — report draft
+    - Assessment/assessment_feedback.md — assessment feedback
+    - Assessment/rubric.md — evaluation rubric
+    - Assessment/iteration_history.md — iteration history
     - Outputs/Final_Report.md — final report
 
     Args:
@@ -301,7 +360,6 @@ def read_file(file_path: str) -> str:
     clean_file_path = file_path.lstrip("/").lstrip("\\")
     if clean_file_path.startswith("workspace/") or clean_file_path.startswith("workspace\\"):
         clean_file_path = clean_file_path[len("workspace/"):]
-    print(f"📖 Read File: {clean_file_path}")
     try:
         # 优先从文件系统读取（确保拿到最新内容，无论是 tool 还是 shared_store 写入的）
         absolute_path = _resolve_workspace_path(clean_file_path)
@@ -311,7 +369,7 @@ def read_file(file_path: str) -> str:
                 memory_content = _shared_store.read_file(clean_file_path)
                 if memory_content is not None:
                     size_kb = len(memory_content.encode("utf-8")) / 1024
-                    print(f"   ✅ Read {size_kb:.1f} KB from {clean_file_path} (from memory)")
+                    cli.tool("read_file", f"{clean_file_path} ({size_kb:.1f} KB, cached)")
                     return memory_content
 
             available = _list_directory_contents(os.path.dirname(clean_file_path))
@@ -322,7 +380,7 @@ def read_file(file_path: str) -> str:
             content = file_handle.read()
 
         size_kb = len(content.encode("utf-8")) / 1024
-        print(f"   ✅ Read {size_kb:.1f} KB from {clean_file_path}")
+        cli.tool("read_file", f"{clean_file_path} ({size_kb:.1f} KB)")
         return content
 
     except ValueError as error:
@@ -340,13 +398,12 @@ def write_file(file_path: str, content: str) -> str:
     Use this to save research results, ideas, assessments, reports, etc.
 
     Common output paths:
-    - Inputs/raw/collected_papers.md — collected papers data
-    - Survey/surveyed.md — per-paper survey notes
+    - Planning/search_plan.md — search plan
     - Survey/report.md — survey summary report
     - Innovation/ideas.md — generated ideas
-    - Innovation/consolidated.md — consolidated ideas
-    - Assessment/assessment_results.json — assessment scores
-    - Outputs/draft.md — report draft
+    - Assessment/assessment_feedback.md — assessment feedback
+    - Assessment/rubric.md — evaluation rubric
+    - Assessment/rubric_dimensions.json — rubric source data
     - Outputs/Final_Report.md — final report
 
     Args:
@@ -360,7 +417,6 @@ def write_file(file_path: str, content: str) -> str:
     clean_file_path = file_path.lstrip("/").lstrip("\\")
     if clean_file_path.startswith("workspace/") or clean_file_path.startswith("workspace\\"):
         clean_file_path = clean_file_path[len("workspace/"):]
-    print(f"✍️ Write File: {clean_file_path}")
     try:
         # 优先通过 shared_store 写入（同时更新内存 + 文件系统）
         if _shared_store is not None:
@@ -373,7 +429,7 @@ def write_file(file_path: str, content: str) -> str:
                 file_handle.write(content)
 
         size_kb = len(content.encode("utf-8")) / 1024
-        print(f"   ✅ Wrote {size_kb:.1f} KB to {clean_file_path}")
+        cli.tool("write_file", f"{clean_file_path} ({size_kb:.1f} KB)")
         return f"✅ Successfully wrote {size_kb:.1f} KB to '{clean_file_path}'"
 
     except ValueError as error:
@@ -390,10 +446,10 @@ def append_file(file_path: str, content: str) -> str:
     Useful for incrementally building up research notes, survey summaries, etc.
 
     Primary use case:
-    - Survey/surveyed.md — append per-source summaries during research
+    - Survey/report.md — append supplementary findings during iterative research
 
     Args:
-        file_path: Relative path within the workspace (e.g., 'Survey/surveyed.md')
+        file_path: Relative path within the workspace (e.g., 'Survey/report.md')
         content: The text content to append to the file
 
     Returns:
@@ -403,7 +459,6 @@ def append_file(file_path: str, content: str) -> str:
     clean_file_path = file_path.lstrip("/").lstrip("\\")
     if clean_file_path.startswith("workspace/") or clean_file_path.startswith("workspace\\"):
         clean_file_path = clean_file_path[len("workspace/"):]
-    print(f"📝 Append File: {clean_file_path}")
     try:
         absolute_path = _resolve_workspace_path(clean_file_path)
         os.makedirs(os.path.dirname(absolute_path), exist_ok=True)
@@ -428,7 +483,7 @@ def append_file(file_path: str, content: str) -> str:
 
         appended_kb = len(content.encode("utf-8")) / 1024
         total_kb = len(new_content.encode("utf-8")) / 1024
-        print(f"   ✅ Appended {appended_kb:.1f} KB to {clean_file_path} (total: {total_kb:.1f} KB)")
+        cli.tool("append_file", f"{clean_file_path} (+{appended_kb:.1f} KB, total {total_kb:.1f} KB)")
         return f"✅ Successfully appended {appended_kb:.1f} KB to '{clean_file_path}' (total: {total_kb:.1f} KB)"
 
     except ValueError as error:
@@ -478,7 +533,7 @@ def list_files(directory: str = "") -> str:
     Returns:
         A formatted list of files found, or a message if the directory is empty.
     """
-    print(f"📂 List Files: {directory or '(root)'}")
+    cli.tool("list_files", directory or "(root)")
     try:
         target_dir = os.path.join(_WORKSPACE_DIR, directory) if directory else _WORKSPACE_DIR
         if not os.path.exists(target_dir):
@@ -534,7 +589,7 @@ def web_fetch(url: str) -> str:
     Returns:
         The extracted main text content of the webpage in Markdown format, or an error message.
     """
-    print(f"🌐 Web Fetch (via Jina Reader): {url}", flush=True)
+    cli.tool("web_fetch", url)
 
     if not url.startswith(("http://", "https://")):
         return f"❌ Invalid URL: '{url}'. Must start with http:// or https://"
@@ -562,7 +617,7 @@ def web_fetch(url: str) -> str:
         elapsed = time.perf_counter() - t0
 
         if not extracted_text or len(extracted_text) < 50:
-            print(f"   ⚠️ Jina returned little content ({elapsed:.1f}s): {url}", flush=True)
+            cli.warn(f"Jina returned little content ({elapsed:.1f}s): {url}")
             return f"⚠️ Could not extract meaningful content from: {url}"
 
         # 截断过长内容
@@ -570,7 +625,7 @@ def web_fetch(url: str) -> str:
             extracted_text = extracted_text[:_MAX_CONTENT_LENGTH] + \
                 f"\n\n... [Content truncated at {_MAX_CONTENT_LENGTH} characters]"
 
-        print(f"   ✅ Extracted {len(extracted_text)} characters from {url} ({elapsed:.1f}s)", flush=True)
+        cli.ok(f"Fetched {len(extracted_text)} chars in {elapsed:.1f}s")
         return f"🌐 **Content from:** {url}\n\n{extracted_text}"
 
     except requests.exceptions.Timeout:
@@ -602,7 +657,8 @@ PDF_TOOLS = [
 SURVEY_TOOLS = [
     *WORKSPACE_TOOLS,
     append_file,      # 追加写入（用于逐条缓存调研摘要）
-    tavily_search,    # 网络搜索
+    tavily_search,    # 网络搜索（单发，用于有依赖的追问）
+    batch_web_search, # 批量并发搜索（多个独立查询一次调用，省时）
     web_fetch,
     pdf_extract_text,
 ]

@@ -11,7 +11,7 @@ The pipeline is designed for **human-in-the-loop** research: you can steer each 
 - **Multi-phase research pipeline**: Survey → Idea → Assessment → Report, orchestrated by a Planning Agent
 - **Human-in-the-loop (HITL)**: pause for feedback after key phases; resume from checkpoint
 - **Iterative refinement**: Assessment feedback can loop back to Idea generation
-- **Skill system**: modular `Skills/*/SKILL.md` files (deep research, survey writing, PDF tools, etc.)
+- **Skill system**: modular `Skills/*/SKILL.md` files (deep research, structured search, report formatting, PDF tools, etc.)
 - **Workspace file system**: all artifacts saved under `workspace/` with a consistent layout
 - **Web & document tools**: Tavily search, web fetch, PDF text extraction, file read/write
 - **Checkpointing**: interrupted runs can be resumed via LangGraph memory checkpointer
@@ -50,7 +50,7 @@ The pipeline is designed for **human-in-the-loop** research: you can steer each 
 | **Planning Agent** | Routes workflow, interprets user intent, initializes plan | 0.7 |
 | **Survey Agent** | Literature & web research, writes `Survey/report.md` | 0.3 |
 | **Idea Agent** | Generates research ideas, writes `Innovation/ideas.md` | 0.95 |
-| **Assessment Agent** | Evaluates ideas against rubric, structured feedback | 0.7 |
+| **Assessment Agent** | Generates domain-adaptive rubric, evaluates ideas, structured feedback | 0.7 |
 | **Report Agent** | Synthesizes final report → `Outputs/Final_Report.md` | 0.7 |
 
 ---
@@ -159,14 +159,15 @@ Provide feedback in natural language (e.g. *"emphasize multi-objective rewards"*
 
 ### Step 4 — Assessment phase
 
-The **Assessment Agent** scores ideas against a rubric and writes structured feedback:
+The **Assessment Agent** first generates a domain-adaptive evaluation rubric, then evaluates ideas against it and writes structured improvement feedback:
 
 ```
 workspace/Assessment/rubric.md
+workspace/Assessment/rubric_dimensions.json
 workspace/Assessment/assessment_feedback.md
 ```
 
-If ideas need improvement, the workflow can loop **Assessment → Idea** automatically.
+If ideas need improvement, the workflow can loop **Assessment → Idea** automatically. The loop stops early when the Assessment Agent's Iteration Verdict is `CONVERGED`, or after reaching the configured max iterations.
 
 ### Step 5 — Report phase
 
@@ -214,11 +215,12 @@ workspace/
 ├── Survey/
 │   └── report.md
 ├── Innovation/
-│   ├── ideas.md
-│   └── human_feedback_idea.md
+│   └── ideas.md
 ├── Assessment/
 │   ├── rubric.md
-│   └── assessment_feedback.md
+│   ├── rubric_dimensions.json   # Rubric source data (adaptive dimensions)
+│   ├── assessment_feedback.md
+│   └── iteration_history.md     # Idea↔Assessment iteration archive
 ├── Outputs/
 │   └── Final_Report.md
 └── History/
@@ -226,6 +228,22 @@ workspace/
 ```
 
 Runtime artifacts under `workspace/` are git-ignored by default (except `.gitkeep` placeholders). Your local runs will not pollute the repository.
+
+---
+
+## Skills
+
+Skills live in `Skills/<name>/SKILL.md` and follow the [Agent Skills](https://docs.langchain.com/oss/python/deepagents/skills) convention (YAML frontmatter + markdown instructions).
+
+| Skill | Purpose |
+|-------|---------|
+| `deep-research` | Multi-angle web research methodology |
+| `deep-search` | Structured search strategies |
+| `report-formatting` | Final report structure |
+| `google-scholar-search` | Scholar-oriented search guidance |
+| `pdf` | PDF handling instructions |
+
+Agents load skills automatically via Deep Agents progressive disclosure.
 
 ---
 
@@ -241,6 +259,7 @@ OmniIDEA/
 ├── prompts.py        # System prompts per agent role
 ├── tools.py          # Tavily, web fetch, PDF, file tools
 ├── storage.py        # Workspace store & path constants
+├── cli.py            # Terminal output formatting
 ├── Skills/           # Agent skill definitions
 ├── workspace/        # Runtime artifacts (git-ignored)
 ├── requirements.txt
@@ -261,6 +280,8 @@ OmniIDEA/
 | `MAX_NEW_TOKENS` | `16384` | Max generation tokens |
 | `AGENT_INVOKE_MAX_RETRIES` | `3` | Retries on transient API errors |
 | `AGENT_RETRY_BASE_DELAY` | `2` | Exponential backoff base (seconds) |
+| `AGENT_RETRY_MAX_DELAY` | `8` | Exponential backoff cap (seconds) |
+| `IDEA_ASSESSMENT_MAX_ITERS` | `2` | Max automatic Idea↔Assessment improvement rounds; the loop also stops early when the Assessment Agent's Iteration Verdict is `CONVERGED` |
 
 ---
 

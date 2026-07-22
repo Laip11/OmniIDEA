@@ -102,6 +102,13 @@ class ResearchState(TypedDict):
     # 专门追踪 Idea→Assessment→Idea 闭环的迭代次数（独立于全局 iteration_count）
     idea_assessment_iterations: int
 
+    # ========== Assessment rubric 源数据 ==========
+    # Rubric Agent 生成的动态维度（结构化 JSON）。存 state 而非仅依赖 workspace 文件：
+    # 文件可能被清理，state 随 checkpointer 存活，保证跨轮复评维度基准不丢失。
+    rubric_dimensions: Optional[List[dict]]
+    # Rubric Agent 修正后的研究领域描述（随维度一起持久化，保证跨轮渲染的 rubric 逐字节一致）
+    rubric_research_domain: Optional[str]
+
     # ========== 文件与资源 ==========
     uploaded_files: Optional[List[str]]
 

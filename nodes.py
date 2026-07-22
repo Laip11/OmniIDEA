@@ -12,6 +12,7 @@ Injected via the skills parameter of create_deep_agent, the framework's SkillsMi
 
 import os
 import json
+import re
 import time
 from typing import Optional, List, Dict
 from langchain_core.messages import HumanMessage
@@ -19,14 +20,15 @@ from langgraph.types import interrupt
 
 from state import ResearchState, PlanningDecision
 from agents import (
-    survey_agent, idea_agent, assessment_agent, report_agent,
-    planning_agent, shared_store, build_agent, model_standard
+    survey_agent, idea_agent, assessment_rubric_agent,
+    report_agent, planning_agent, shared_store, build_agent, model_standard
 )
-from tools import ALL_TOOLS
+from tools import ALL_TOOLS, AGENT_BASE_TOOLS
 from prompts import (
     get_human_review_prompt,
     get_planning_analysis_prompt,
     PLANNING_INIT_PROMPT,
+    ASSESSMENT_AGENT_PROMPT,
 )
 from storage import (
     PLANNING_GLOBAL_CONTEXT,
@@ -38,11 +40,14 @@ from storage import (
     INNOVATION_IDEAS,
     INNOVATION_HUMAN_FEEDBACK,
     ASSESSMENT_RUBRIC,
-    ASSESSMENT_RESULTS,
+    ASSESSMENT_RUBRIC_DIMENSIONS,
     ASSESSMENT_FEEDBACK,
+    ASSESSMENT_ITERATION_HISTORY,
     ASSESSMENT_HUMAN_FEEDBACK,
     OUTPUTS_FINAL_REPORT,
 )
+
+import cli
 
 # ==========================================
 # Unified Agent invocation retry mechanism
@@ -52,6 +57,9 @@ MAX_RETRIES = int(os.environ.get("AGENT_INVOKE_MAX_RETRIES", "3"))
 # 指数退避：第 1 次失败后等 base，第 2 次失败后等 2*base，不超过 max（默认约 2s + 4s，比原先 5s+10s 快）
 RETRY_BASE_DELAY = float(os.environ.get("AGENT_RETRY_BASE_DELAY", "2"))
 RETRY_MAX_DELAY = float(os.environ.get("AGENT_RETRY_MAX_DELAY", "8"))
+
+# Idea↔Assessment 闭环最大自动迭代轮数（可通过环境变量覆盖）
+MAX_IDEA_ASSESSMENT_ITERS = int(os.environ.get("IDEA_ASSESSMENT_MAX_ITERS", "2"))
 
 def invoke_agent_with_retry(agent, messages, config, agent_name="Agent"):
 
@@ -84,20 +92,104 @@ def invoke_agent_with_retry(agent, messages, config, agent_name="Agent"):
             ])
 
             if not is_retryable or attempt == MAX_RETRIES:
-                print(f"   >>> ❌ {agent_name} invocation failed (attempt {attempt}/{MAX_RETRIES}): {error}")
+                cli.error(f"{agent_name} invocation failed (attempt {attempt}/{MAX_RETRIES}): {error}")
                 raise
 
             delay = min(
                 RETRY_BASE_DELAY * (2 ** (attempt - 1)),
                 RETRY_MAX_DELAY,
             )
-            print(f"   >>> ⚠️ {agent_name} connection failed (attempt {attempt}/{MAX_RETRIES}), retrying in {delay:.0f}s...")
-            print(f"       Error: {str(error)[:100]}")
+            cli.warn(f"{agent_name} connection failed (attempt {attempt}/{MAX_RETRIES}), retrying in {delay:.0f}s — {str(error)[:100]}")
             time.sleep(delay)
 
 # ==========================================
 # File write verification and fallback mechanism
 # ==========================================
+
+def _sanitize_extracted_content(content: str) -> str:
+    """
+    Sanitize content recovered from Agent reply text before persisting it to a file.
+
+    Reply text may carry model reasoning blocks or conversational wrappers
+    ("Here is the report...", "Let me know if you need changes") that must never
+    reach workspace files. Design principle: prefer a false negative (a leftover
+    conversational line is visible and easy to delete) over a false positive
+    (silently deleting legitimate content is hard to detect). Every rule below is
+    anchored so it cannot bite into body text:
+    1. Reasoning blocks (<think>...</think>) are stripped ONLY at the very start,
+       where providers inline them — body text discussing such tags is untouched
+    2. Conversational lead-ins are stripped ONLY when immediately followed by a
+       Markdown structural line — prose starting with words like "首先" is untouched
+    3. Sign-off patterns require explicit conversational forms — academic closers
+       like "以上分析表明..." are untouched
+    """
+    import re
+    if not content:
+        return content
+    original_len = len(content)
+
+    # 1. Strip reasoning blocks only at the very beginning (loop for consecutive blocks)
+    content = content.lstrip()
+    while True:
+        think_match = re.match(r"<think(?:ing)?>.*?</think(?:ing)?>\s*", content, flags=re.DOTALL | re.IGNORECASE)
+        if not think_match:
+            break
+        content = content[think_match.end():].lstrip()
+
+    # 2. Strip conversational lead-in lines ONLY when the lead-in block is immediately
+    #    followed by a Markdown structural line (heading, table, list, fence, quote)
+    leadin_pattern = re.compile(
+        r"^(?:okay|ok|sure|great|certainly|here\s+(?:is|are)|i\s+(?:have|will|'ve|am)|let\s+me|"
+        r"好的|当然|以下是|下面是|我已|我将|让我|现在|接下来|根据(?:你的|要求))",
+        re.IGNORECASE,
+    )
+    lines = content.split("\n")
+    saw_leadin = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if leadin_pattern.match(stripped):
+            saw_leadin = True
+            continue
+        # First non-blank, non-leadin line: strip the lead-in block only if it is structural
+        if saw_leadin and stripped.startswith(("#", "|", "- ", "```", ">")):
+            lines = lines[i:]
+        break
+    content = "\n".join(lines)
+
+    # 3. Strip conversational sign-off lines at the very end (explicit conversational
+    #    forms only; academic closers such as "以上分析表明" never match)
+    signoff_pattern = re.compile(
+        r"^(?:please\s+(?:review|let me know|feel free)|let me know|"
+        r"if you (?:need|have|would|want)|i hope|hope this|feel free|"
+        r"the above (?:report|assessment|feedback|content|ideas?|analysis) (?:is|has been|was)|"
+        r"请(?:查收|审阅|查看|提出)|如有需要|如需(?:进一步|其他)|希望(?:这份|这|能)|"
+        r"以上(?:报告|评估|反馈|内容)[^\n]*(?:已完成|已保存|供参考))",
+        re.IGNORECASE,
+    )
+    lines = content.rstrip().split("\n")
+    end = len(lines)
+    while end > 0:
+        stripped = lines[end - 1].strip()
+        if not stripped or signoff_pattern.match(stripped):
+            end -= 1
+        else:
+            break
+    content = "\n".join(lines[:end])
+
+    content = content.strip()
+
+    # 4. Audit trail: log what was stripped; warn loudly when the stripped share is
+    #    suspiciously large (possible over-stripping → human should inspect the file)
+    removed = original_len - len(content)
+    if removed > 0:
+        cli.debug(f"Sanitized extracted content: stripped {removed}/{original_len} chars")
+        if removed > original_len * 0.3:
+            cli.warn(f"Sanitizer stripped {removed}/{original_len} chars (>30%) from recovered content — inspect the saved file for over-stripping")
+
+    return content
+
 
 def verify_and_save_outputs(agent_response, expected_files: list, agent_name: str):
     """
@@ -117,10 +209,10 @@ def verify_and_save_outputs(agent_response, expected_files: list, agent_name: st
     for file_path in expected_files:
         content = shared_store.read_file(file_path)
         if content and len(content.strip()) > 0:
-            print(f"   ✅ File verified: {file_path}")
+            cli.debug(f"File verified: {file_path}")
         else:
             missing_files.append(file_path)
-            print(f"   ⚠️ File missing: {file_path}")
+            cli.warn(f"File missing: {file_path}")
 
     if not missing_files:
         return
@@ -132,7 +224,7 @@ def verify_and_save_outputs(agent_response, expected_files: list, agent_name: st
     for file_path in missing_files:
         if file_path in tool_call_extracted:
             shared_store.write_file(file_path, tool_call_extracted[file_path])
-            print(f"   🔄 Extracted and saved from {agent_name}'s tool_calls: {file_path}")
+            cli.note(f"Recovered from {agent_name}'s tool_calls: {file_path}")
         else:
             still_after_tool_calls.append(file_path)
 
@@ -144,7 +236,7 @@ def verify_and_save_outputs(agent_response, expected_files: list, agent_name: st
     # Try to extract content from Agent reply
     reply_content = _extract_agent_reply(agent_response)
     if not reply_content:
-        print(f"   ⚠️ {agent_name} did not generate extractable reply content, cannot fallback save missing files")
+        cli.warn(f"{agent_name} produced no extractable reply content; cannot fallback-save missing files")
         return
 
     # Round one: try to precisely extract content for each file
@@ -152,8 +244,8 @@ def verify_and_save_outputs(agent_response, expected_files: list, agent_name: st
     for file_path in missing_files:
         extracted = _extract_file_content_from_reply(reply_content, file_path)
         if extracted:
-            shared_store.write_file(file_path, extracted)
-            print(f"   🔄 Extracted and saved from {agent_name} reply: {file_path}")
+            shared_store.write_file(file_path, _sanitize_extracted_content(extracted))
+            cli.note(f"Recovered from {agent_name} reply: {file_path}")
         else:
             still_missing.append(file_path)
 
@@ -169,19 +261,19 @@ def verify_and_save_outputs(agent_response, expected_files: list, agent_name: st
 
         for file_path, section_content in split_results.items():
             if section_content and len(section_content.strip()) > 50:
-                shared_store.write_file(file_path, section_content.strip())
-                print(f"   🔄 Split and saved from {agent_name} reply: {file_path}")
+                shared_store.write_file(file_path, _sanitize_extracted_content(section_content))
+                cli.note(f"Split-saved from {agent_name} reply: {file_path}")
                 md_still_missing.remove(file_path)
 
         # If after splitting there is exactly one .md file still missing and reply looks like valid Markdown, save as whole
         is_valid_markdown = reply_content.strip().startswith("#") and len(reply_content) > 200
         if len(md_still_missing) == 1 and is_valid_markdown:
-            shared_store.write_file(md_still_missing[0], reply_content)
-            print(f"   🔄 Saved {agent_name} complete reply as: {md_still_missing[0]}")
+            shared_store.write_file(md_still_missing[0], _sanitize_extracted_content(reply_content))
+            cli.note(f"Saved {agent_name} full reply as: {md_still_missing[0]}")
             md_still_missing.clear()
 
     for file_path in md_still_missing + non_md_missing:
-        print(f"   ❌ Unable to extract content for {file_path} from reply, please check if {agent_name} correctly called write_file")
+        cli.error(f"Cannot extract {file_path} from reply — check whether {agent_name} called write_file")
 
 
 def _extract_write_file_from_tool_calls(agent_response, target_files: list) -> Dict[str, str]:
@@ -557,7 +649,7 @@ def _generate_search_plan(topic: str, user_feedback: Optional[str] = None) -> di
     """
     is_iteration = user_feedback is not None
     phase_label = "iterative modification" if is_iteration else "initial generation"
-    print(f"\n--- 🚀 Initialization phase (search plan {phase_label}) ---")
+    cli.stage("Initialization", f"search plan · {phase_label}")
 
     # Build a temporary initialization Agent with dedicated search plan generation prompt
     # This Agent is disposable and does not affect the planning_agent in subsequent regular scheduling
@@ -602,16 +694,16 @@ Please adjust the search query list based on user feedback, keeping reasonable p
     # Verify whether Agent has successfully written the search plan; if not, extract from reply and save as fallback
     search_plan_content = shared_store.read_file(PLANNING_SEARCH_PLAN)
     if search_plan_content:
-        print(f"   >>> 📋 Search plan generated ({len(search_plan_content)} chars)")
+        cli.ok(f"Search plan generated ({len(search_plan_content)} chars)")
     else:
-        print("   >>> ⚠️ Search plan file not generated, attempting to extract from reply...")
+        cli.warn("Search plan file not generated, attempting to extract from reply...")
         reply_content = _extract_agent_reply(init_response)
         if reply_content and len(reply_content.strip()) > 50:
             shared_store.write_file(PLANNING_SEARCH_PLAN, reply_content)
             search_plan_content = reply_content
-            print(f"   >>> 🔄 Extracted and saved search plan from Planning Agent reply ({len(reply_content)} chars)")
+            cli.note(f"Extracted and saved search plan from Planning Agent reply ({len(reply_content)} chars)")
         else:
-            print("   >>> ⚠️ Unable to extract search plan from reply, Survey Agent will plan search strategy independently")
+            cli.warn("Unable to extract search plan from reply — Survey Agent will plan independently")
 
     # Extract domain information from search plan
     primary_domain = ""
@@ -644,8 +736,8 @@ Please adjust the search query list based on user feedback, keeping reasonable p
         json.dumps(global_context, ensure_ascii=False, indent=2)
     )
 
-    print(f"   >>> Primary domain: {primary_domain or 'Not identified'}")
-    print(f"   >>> Max iterations: {research_plan['max_iterations']}")
+    cli.kv("Primary domain", primary_domain or "Not identified")
+    cli.kv("Max iterations", str(research_plan["max_iterations"]))
 
     return {
         "research_plan": research_plan,
@@ -714,7 +806,7 @@ def run_survey_node(state: ResearchState):
     Both initial survey and iterative supplements are executed through Survey Agent to ensure consistent search logic.
     """
     iteration_count = state.get('iteration_count', 0)
-    print(f"\n--- 🔍 Survey phase - iteration {iteration_count + 1} ---")
+    cli.stage("STAGE 1/4 · Survey", f"iteration {iteration_count + 1}")
 
     topic = state["topic"]
     human_feedback = state.get("human_feedback")
@@ -726,7 +818,7 @@ def run_survey_node(state: ResearchState):
 
     if iteration_count == 0:
         # Initial survey: use Survey Agent for in-depth research (two-phase process)
-        print(f"   >>> 🤖 Calling Survey Agent for initial in-depth survey (search cache → integrated report)...")
+        cli.info("Calling Survey Agent for initial in-depth survey (search cache → integrated report)")
         
         survey_prompt = f"""## Initial In-depth Survey Task
 
@@ -753,13 +845,20 @@ def run_survey_node(state: ResearchState):
         
     else:
         # Iterative supplement: use Survey Agent for supplementary search and integration
-        print(f"   >>> 🤖 Calling Survey Agent for supplementary search and integration...")
+        cli.info("Calling Survey Agent for supplementary search and integration")
         
         # Build supplementary search instructions
         if human_feedback:
             supplement_instruction = f"User feedback: {human_feedback}"
         else:
-            supplement_instruction = "Please read `Assessment/assessment_results.json` via `read_file` for assessment feedback and conduct supplementary research based on the improvement suggestions."
+            supplement_instruction = "Please read `Assessment/assessment_feedback.md` via `read_file` for assessment feedback and conduct supplementary research based on the improvement suggestions."
+
+        # Attach accumulated search directions from earlier user guidance (deduplicated against current feedback)
+        search_directions = state.get("search_directions", []) or []
+        extra_directions = [d for d in search_directions if d and d.strip() and d.strip() != (human_feedback or "").strip()]
+        if extra_directions:
+            directions_text = "\n".join(f"- {d}" for d in extra_directions)
+            supplement_instruction += f"\n\nAccumulated search directions from earlier user feedback:\n{directions_text}"
 
         survey_prompt = f"""## Supplementary Survey Task
 
@@ -788,11 +887,11 @@ Please begin execution.
     # Final report status confirmation
     final_report = shared_store.read_file(SURVEY_REPORT)
     if final_report:
-        print(f"   >>> ✅ Survey report saved ({len(final_report)} chars)")
+        cli.ok(f"Survey report saved ({len(final_report)} chars)")
     else:
-        print(f"   >>> ⚠️ Survey report not generated, please check Survey Agent output")
+        cli.warn("Survey report not generated — please check Survey Agent output")
 
-    print("   >>> 🔍 Survey complete")
+    cli.ok("Survey phase complete")
 
     return {
         "iteration_count": iteration_count + 1,
@@ -808,8 +907,8 @@ def run_idea_node(state: ResearchState):
     Reads from Inputs/raw/ and Survey/, writes to Innovation/.
     """
     iteration_count = state.get('iteration_count', 0)
-    print(f"\n--- 💡 Ideation phase (Idea) - iteration {iteration_count + 1} ---")
-    print("   >>> 🌡️ Using high-temperature model + four-phase deep innovation process")
+    cli.stage("STAGE 2/4 · Ideation", f"iteration {iteration_count + 1}")
+    cli.info("High-temperature model + four-phase deep innovation process")
 
     topic = state["topic"]
     human_feedback = state.get("human_feedback")
@@ -837,13 +936,22 @@ def run_idea_node(state: ResearchState):
             prompt_parts.append("\nPlease generate innovative proposals based on the survey report and the user feedback above.")
     elif has_existing_ideas and has_assessment_feedback:
         # True iteration: both previous ideas and assessment feedback exist
-        prompt_parts.append("## Iteration Task")
-        prompt_parts.append("Please read `Innovation/ideas.md` to review your current ideas, then read `Assessment/assessment_feedback.md` via `read_file` for detailed assessment feedback, and read `Assessment/assessment_results.json` for specific improvement suggestions. Optimize your ideas accordingly based on this feedback.")
+        loop_round = state.get("idea_assessment_iterations", 0)
+        prompt_parts.append(f"## Iteration Task (Improvement Round {loop_round})")
+        prompt_parts.append(
+            "Please read `Innovation/ideas.md` to review your current ideas, then read `Assessment/assessment_feedback.md` via `read_file` for the latest structured assessment feedback. "
+            f"If `{ASSESSMENT_ITERATION_HISTORY}` exists, read it as well to understand the full revision trajectory — do not repeat approaches that already failed in previous rounds. "
+            "Address EVERY improvement priority in the feedback with concrete, mechanism-level revisions (not surface rewording), while preserving the strengths of the existing ideas."
+        )
     else:
         # First-time generation (or recovery from a failed previous attempt)
         if iteration_count > 0 and not has_existing_ideas:
-            print("   ⚠️ iteration_count > 0 but Innovation/ideas.md is missing — treating as first-time generation")
+            cli.warn("iteration_count > 0 but Innovation/ideas.md is missing — treating as first-time generation")
         prompt_parts.append("Please generate innovative proposals based on the survey report, targeting user needs. Requesting file uploads or waiting for confirmation is strictly prohibited; generate ideas directly.")
+
+    focus_areas = state.get("focus_areas")
+    if focus_areas:
+        prompt_parts.append(f"\n## Focus Areas (identified by Planning Agent)\n{focus_areas}")
 
     if uploaded_files:
         prompt_parts.append(f"\n## User-uploaded reference files:")
@@ -870,7 +978,7 @@ def run_idea_node(state: ResearchState):
         agent_name="Idea Agent"
     )
 
-    print(f"   >>> 💡 Ideation complete")
+    cli.ok("Ideation complete")
 
     return {
         "iteration_count": iteration_count + 1,
@@ -886,18 +994,25 @@ def run_idea_node(state: ResearchState):
 
 def build_dynamic_rubric(primary_domain: str, domain_keywords: dict, topic: str) -> dict:
     """
-    Build Rubric configuration with fixed dimensions and instructions for Agent-generated dynamic dimensions.
+    Build Rubric configuration: fixed dimensions (source of truth) + domain context hints.
 
     Fixed dimensions (70% weight) are predefined for universal evaluation quality.
-    Dynamic dimensions (30% weight) are fully delegated to the Assessment Agent, which generates
-    them based on the user's research topic, domain context, and survey findings.
+    Adaptive dimensions (30% weight) are produced by the dedicated Rubric Agent as
+    structured JSON and merged programmatically at render time.
     """
+    # Scoring anchors live here (single source of truth) so the rubric file itself
+    # carries complete evaluation guidance — no parallel definition in any system prompt.
     fixed_dimensions = [
-        {"dimension": "Coherence", "definition": "Whether the idea is internally logically consistent with clear causal chains between parts", "weight": 0.14},
-        {"dimension": "Credibility", "definition": "Whether the idea is supported by sufficient theoretical basis or experimental evidence", "weight": 0.14},
-        {"dimension": "Verifiability", "definition": "Whether the idea can be verified through experiments, simulations, or prototypes", "weight": 0.14},
-        {"dimension": "Novelty", "definition": "The degree of innovation of the idea relative to existing technologies and literature", "weight": 0.14},
-        {"dimension": "Alignment", "definition": "The degree to which the idea matches the user's research topic and constraints", "weight": 0.14},
+        {"dimension": "Coherence", "definition": "Whether the idea is internally logically consistent with clear causal chains between parts", "weight": 0.14,
+         "criteria": "0-3: Logically confused; 4-6: Basically self-consistent; 7-9: Logically rigorous; 10: Perfect"},
+        {"dimension": "Credibility", "definition": "Whether the idea is supported by sufficient theoretical basis or experimental evidence", "weight": 0.14,
+         "criteria": "0-3: No basis; 4-6: Partial basis; 7-9: Well-supported; 10: Multi-source evidence"},
+        {"dimension": "Verifiability", "definition": "Whether the idea can be verified through experiments, simulations, or prototypes", "weight": 0.14,
+         "criteria": "0-3: Cannot be verified; 4-6: Path unclear; 7-9: Clear plan; 10: Clear path with controllable cost"},
+        {"dimension": "Novelty", "definition": "The degree of innovation of the idea relative to existing technologies and literature", "weight": 0.14,
+         "criteria": "0-3: Simple repetition; 4-6: Has improvements; 7-9: Novel method; 10: Breakthrough innovation"},
+        {"dimension": "Alignment", "definition": "The degree to which the idea matches the user's research topic and constraints", "weight": 0.14,
+         "criteria": "0-3: Irrelevant; 4-6: Partially relevant; 7-9: Highly relevant; 10: Perfect match"},
     ]
 
     # Collect domain context hints for the Agent (non-prescriptive, purely informational)
@@ -926,27 +1041,298 @@ def build_dynamic_rubric(primary_domain: str, domain_keywords: dict, topic: str)
             "dynamic_total": 0.30,
             "fixed_per_dimension": 0.14,
         },
-        "dynamic_dimension_instructions": (
-            "The Assessment Agent MUST generate 2-4 domain-specific evaluation dimensions "
-            "tailored to the research topic, with a combined weight of exactly 30%. "
-            "These dimensions should reflect the most critical evaluation criteria "
-            "specific to the user's research domain and topic. "
-            "Each dimension must include: name, definition, and weight. "
-            "After assessment, sort by weighted total score from high to low and output only the top 3 ideas."
-        ),
     }
 
     return rubric_config
 
+
+def _validate_rubric_dimensions(data, fixed_names: list) -> list:
+    """Validate the Rubric Agent's JSON output; return the dimensions list.
+
+    Raises ValueError on any structural or semantic violation.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("top level is not a JSON object")
+    dims = data.get("adaptive_dimensions")
+    if not isinstance(dims, list) or not 2 <= len(dims) <= 4:
+        raise ValueError("adaptive_dimensions must be a list of 2-4 entries")
+    total_weight = 0.0
+    for entry in dims:
+        if not isinstance(entry, dict) or not all(k in entry for k in ("name", "weight", "definition")):
+            raise ValueError(f"dimension entry missing required fields: {entry}")
+        if entry["name"] in fixed_names:
+            raise ValueError(f"dimension duplicates a fixed dimension: {entry['name']}")
+        total_weight += float(entry["weight"])
+    if abs(total_weight - 0.30) > 0.01:
+        raise ValueError(f"adaptive weights sum to {total_weight:.2f}, expected 0.30")
+    return dims
+
+
+def _load_rubric_dimensions(fixed_names: list):
+    """Load adaptive dimensions from the JSON sidecar (cross-process fallback).
+
+    Returns (dimensions, research_domain) or (None, "") when unavailable/invalid.
+    """
+    raw = shared_store.read_file(ASSESSMENT_RUBRIC_DIMENSIONS)
+    if not raw:
+        return None, ""
+    try:
+        data = json.loads(raw)
+        return _validate_rubric_dimensions(data, fixed_names), (data.get("research_domain") or "")
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None, ""
+
+
+def _render_rubric_md(rubric_config: dict, dimensions: list, research_domain: str) -> str:
+    """Render the complete rubric document (fixed + adaptive + scoring rules).
+
+    rubric.md is a VIEW of the rubric source data (fixed dimensions from code,
+    adaptive dimensions from state/JSON) — never a source of truth itself.
+    """
+    lines = [
+        "# Evaluation Rubric",
+        "",
+        "<!-- Auto-generated view: fixed dimensions (code) + adaptive dimensions",
+        f"     ({ASSESSMENT_RUBRIC_DIMENSIONS}). Regenerated every assessment round — manual edits are overwritten. -->",
+        "",
+        f"**Research Domain**: {research_domain}",
+        f"**Research Topic**: {rubric_config['topic']}",
+        "",
+        "## Fixed Evaluation Dimensions (Total Weight 70%)",
+        "",
+        "| Dimension | Weight | Definition | Scoring Criteria |",
+        "|-----------|--------|------------|------------------|",
+    ]
+    for dim in rubric_config["fixed_dimensions"]:
+        lines.append(f"| {dim['dimension']} | {dim['weight']:.0%} | {dim['definition']} | {dim['criteria']} |")
+    lines += [
+        "",
+        "## Domain-Adaptive Evaluation Dimensions (Total Weight 30%)",
+        "",
+        "| Dimension | Weight | Definition |",
+        "|-----------|--------|------------|",
+    ]
+    for entry in dimensions:
+        lines.append(f"| {entry['name']} | {float(entry['weight']):.0%} | {entry['definition']} |")
+    lines += [
+        "",
+        "## Scoring Rules",
+        "",
+        f"- Scoring range: {rubric_config['scoring_range']} per dimension",
+        "- Composite score = Σ(Fixed dimension score × weight) + Σ(Adaptive dimension score × weight)",
+        f"- Output Top {rubric_config['top_n']} ideas ranked by composite score",
+    ]
+    return "\n".join(lines)
+
+
+def _generate_rubric_dimensions(topic: str, rubric_config: dict):
+    """Generate adaptive dimensions via the dedicated Rubric Agent (JSON output).
+
+    Retries once on invalid output; raises RuntimeError if still invalid
+    (rubric duties are decoupled from the evaluator — never fall back to it).
+    Returns (dimensions, research_domain).
+    """
+    cli.info("Step 1/2: generating domain-adaptive dimensions")
+    fixed_names = [d["dimension"] for d in rubric_config["fixed_dimensions"]]
+    hints = rubric_config.get("domain_context_hints", [])
+    hints_text = "\n".join(f"- {hint}" for hint in hints)
+
+    rubric_prompt = (
+        "# Rubric Design Task\n\n"
+        f"Research topic: {topic}\n\n"
+        + (f"Domain context (for reference):\n{hints_text}\n\n" if hints_text else "")
+        + "Design 2-4 domain-adaptive evaluation dimensions for assessing research ideas on this topic, "
+        f"avoiding overlap with the fixed dimensions: {', '.join(fixed_names)}. "
+        f"Save them via `write_file(\"{ASSESSMENT_RUBRIC_DIMENSIONS}\", ...)` as a JSON object following the <output_schema> in your role instructions.\n\n"
+        "Do NOT evaluate any ideas in this step — idea evaluation happens in a separate step."
+    )
+
+    last_error = None
+    for attempt in (1, 2):
+        invoke_agent_with_retry(
+            assessment_rubric_agent,
+            {"messages": [HumanMessage(content=rubric_prompt)]},
+            config={"configurable": {"thread_id": "assess_rubric_thread"}},
+            agent_name="Assessment Rubric Agent"
+        )
+        raw = shared_store.read_file(ASSESSMENT_RUBRIC_DIMENSIONS)
+        try:
+            data = json.loads(raw) if raw else None
+            dims = _validate_rubric_dimensions(data, fixed_names)
+            cli.ok(f"Rubric dimensions finalized ({len(dims)} adaptive dimensions)")
+            return dims, (data.get("research_domain") or "")
+        except (ValueError, TypeError, json.JSONDecodeError) as err:
+            last_error = err
+            cli.warn(f"Rubric dimensions invalid (attempt {attempt}/2): {err}")
+    raise RuntimeError(
+        f"Assessment Rubric Agent failed to produce valid dimensions after 2 attempts: {last_error}"
+    )
+
+def _extract_rubric_summary(rubric_section: str) -> str:
+    """Extract a compact 'name weight%, ...' line from a full rubric section's tables.
+
+    Keeps the delta-analysis agent informed about which dimensions/weights the
+    archived round actually used (avoids it guessing from score-table column
+    names), at ~200 chars instead of the full ~1.5KB rubric section.
+    """
+    dims = []
+    for line in rubric_section.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) < 2 or not cells[0] or cells[0].startswith("---") or cells[0].lower() == "dimension":
+            continue
+        if re.fullmatch(r"\d+(?:\.\d+)?\s*%", cells[1]):
+            dims.append(f"{cells[0]} {cells[1]}")
+    return ", ".join(dims)
+
+
+def _condense_priorities_block(block: str) -> str:
+    """Keep only each numbered priority's bolded title + its first sentence.
+
+    The long Improvement-direction / Expected-effect elaborations are consumed by
+    the Idea Agent from the CURRENT feedback file before archiving; the archive
+    only needs the priority headlines for later delta checks.
+    """
+    out_lines = []
+    seen_first_item = False
+    for line in block.split("\n"):
+        if re.match(r"^\s*\d+\.\s+\*\*", line):
+            seen_first_item = True
+            flat = " ".join(line.split())
+            m = re.match(r"^(\d+\.\s+\*\*[^*]+\*\*):?\s*(.*)$", flat)
+            if m:
+                head, rest = m.group(1), m.group(2)
+                first_sentence = re.split(r"(?<=[.!?])\s", rest, maxsplit=1)[0] if rest else ""
+                out_lines.append(f"{head}: {first_sentence}" if first_sentence else head)
+            else:
+                out_lines.append(flat[:200])
+        elif seen_first_item and line.strip():
+            # Continuation/elaboration of a priority item — dropped from archive.
+            continue
+        else:
+            out_lines.append(line)
+    return "\n".join(out_lines)
+
+
+def _condense_feedback_for_archive(feedback_content: str) -> str:
+    """Condense a full assessment feedback document for iteration-history archival.
+
+    The archive only needs enough signal for later delta analysis and revision-
+    trajectory tracking, so this drops redundancy:
+    - the "## Evaluation Rubric" section (rubric.md is stored separately and is
+      stable across rounds),
+    - "**Core Strengths**" narratives per idea,
+    - per-priority elaborations under "**Improvement Priorities**" (only the
+      bolded priority title plus its first sentence is kept).
+    Everything else (delta analysis, overall assessment, core weaknesses, score
+    tables, ranking, verdict, cross-idea suggestions) is preserved verbatim.
+    The dropped rubric section is replaced by a one-line dimension/weight summary
+    so later delta analysis knows exactly which rubric the round used.
+
+    Falls back to the rubric-stripped full text when the expected structure is
+    not found, so no information is lost on unexpected formats.
+    """
+    text = feedback_content.strip()
+
+    def _strip_rubric_section(t: str) -> str:
+        parts = re.split(r"(?m)^(?=## )", t)
+        if not any(p.lstrip().startswith("## Evaluation Rubric") for p in parts):
+            return t
+        out = []
+        for p in parts:
+            if p.lstrip().startswith("## Evaluation Rubric"):
+                summary = _extract_rubric_summary(p)
+                if summary:
+                    out.append("## Evaluation Rubric (archived summary)\n\n"
+                               f"Dimensions & weights used this round: {summary}.\n\n")
+            else:
+                out.append(p)
+        return "".join(out)
+
+    rubric_stripped = _strip_rubric_section(text)
+
+    sections = re.split(r"(?m)^(?=## )", rubric_stripped)
+    out = []
+    condensed_any = False
+    for section in sections:
+        if not section.lstrip().startswith("## Improvement Guide"):
+            out.append(section)
+            continue
+        ideas = re.split(r"(?m)^(?=### )", section)
+        rebuilt = [ideas[0]]
+        for chunk in ideas[1:]:
+            blocks = re.split(
+                r"(?m)(?=^\*\*(?:Scores|Core Strengths|Core Weaknesses|Improvement Priorities)\b)",
+                chunk,
+            )
+            kept_blocks = []
+            for block in blocks:
+                stripped = block.lstrip()
+                if stripped.startswith("**Core Strengths**"):
+                    condensed_any = True
+                    continue
+                if stripped.startswith("**Improvement Priorities**"):
+                    condensed_any = True
+                    block = _condense_priorities_block(block)
+                kept_blocks.append(block)
+            rebuilt.append("".join(kept_blocks))
+        out.append("".join(rebuilt))
+    condensed = "".join(out).strip()
+
+    # Safety net: unexpected structure → fall back to the rubric-stripped text
+    # rather than risk archiving too little.
+    if not condensed_any or len(condensed) < 500:
+        return rubric_stripped
+    return condensed
+
+
+def _archive_feedback_to_iteration_history(round_num: int, feedback_content: str):
+    """
+    Archive a completed round's feedback (condensed) into the iteration history
+    log, so later assessment rounds can perform delta analysis and the Idea Agent
+    can see the revision trajectory — without unbounded history growth.
+    """
+    history = shared_store.read_file(ASSESSMENT_ITERATION_HISTORY) or "# Idea↔Assessment Iteration History\n"
+    archived = _condense_feedback_for_archive(feedback_content)
+    entry = f"\n\n---\n\n## Round {round_num} Assessment (archived)\n\n{archived}\n"
+    shared_store.write_file(ASSESSMENT_ITERATION_HISTORY, history + entry)
+    cli.note(
+        f"Round {round_num} feedback archived → {ASSESSMENT_ITERATION_HISTORY} "
+        f"(condensed {len(feedback_content)} → {len(archived)} chars)"
+    )
+
+
 def run_assessment_node(state: ResearchState):
     """
     Assessment phase node (dynamic Rubric scoring + importance filtering).
-    Reads from Innovation/ and Survey/, writes to Assessment/assessment_results.json.
+    Reads from Innovation/ and Survey/, writes to Assessment/assessment_feedback.md.
+    Supports multi-round re-evaluation: previous rounds' feedback is archived to
+    Assessment/iteration_history.md so the Agent can perform delta analysis.
     """
-    print("\n--- ⚖️ Assessment phase (Assessment - Dynamic Rubric Scoring) ---")
+    cli.stage("STAGE 3/4 · Assessment", "dynamic rubric scoring")
 
     topic = state["topic"]
     multi_context = state.get("multi_context", {}) or {}
+    human_feedback = state.get("human_feedback")
+
+    # Iteration round tracking: archive the previous round's feedback before it is overwritten.
+    # Skip archiving for a user-feedback revision — it is not a new Idea↔Assessment round.
+    # NOTE: count only archive HEADERS ("## Round N Assessment (archived)") — archived
+    # feedback content itself may contain "## Round ..." references that would
+    # otherwise inflate the count and skip round numbers.
+    previous_feedback = shared_store.read_file(ASSESSMENT_FEEDBACK)
+    if previous_feedback and previous_feedback.strip() and not human_feedback:
+        history_text = shared_store.read_file(ASSESSMENT_ITERATION_HISTORY) or ""
+        completed_rounds = len(re.findall(r"^## Round \d+ Assessment \(archived\)", history_text, re.MULTILINE))
+        _archive_feedback_to_iteration_history(completed_rounds + 1, previous_feedback)
+        assessment_round = completed_rounds + 2
+    else:
+        assessment_round = 0 if human_feedback else 1
+
+    if assessment_round > 1:
+        cli.info(f"Re-evaluation round {assessment_round} (delta analysis against iteration history)")
 
     primary_domain = multi_context.get("primary_domain", "")
     domain_keywords = multi_context.get("domain_keywords", {})
@@ -954,52 +1340,33 @@ def run_assessment_node(state: ResearchState):
     # Build dynamic Rubric configuration
     rubric_config = build_dynamic_rubric(primary_domain, domain_keywords, topic)
 
-    print(f"   >>> Adaptive dimensions: To be generated by Agent based on research topic (30% total)")
+    # ---- Resolve adaptive rubric dimensions (source data, view-independent) ----
+    # Priority: LangGraph state (survives workspace cleanup) → JSON sidecar (cross-process).
+    # rubric.md is only a rendered VIEW of these sources — it is rebuilt every round,
+    # so deleting it never loses the cross-round scoring baseline.
+    fixed_names = [d["dimension"] for d in rubric_config["fixed_dimensions"]]
+    dimensions = state.get("rubric_dimensions")
+    research_domain = state.get("rubric_research_domain") or ""
+    if not dimensions:
+        dimensions, research_domain = _load_rubric_dimensions(fixed_names)
 
-    # ---- Persist rubric to Assessment/rubric.md so the Agent can read it ----
-    rubric_md_lines = [
-        "# Evaluation Rubric",
-        "",
-        f"**Research Domain**: {rubric_config['primary_domain']}",
-        f"**Research Topic**: {rubric_config['topic']}",
-        "",
-        "## Fixed Evaluation Dimensions (Total Weight 70%)",
-        "",
-        "| Dimension | Weight | Definition |",
-        "|-----------|--------|------------|",
-    ]
-    for dim in rubric_config["fixed_dimensions"]:
-        rubric_md_lines.append(f"| {dim['dimension']} | {dim['weight']:.0%} | {dim['definition']} |")
+    if not dimensions:
+        # First round (or all sources lost): generate via the dedicated Rubric Agent
+        dimensions, research_domain = _generate_rubric_dimensions(topic, rubric_config)
+    else:
+        cli.info(f"Reusing adaptive rubric dimensions from source data ({len(dimensions)} dimensions)")
 
-    rubric_md_lines.append("")
-    rubric_md_lines.append("## Domain-Adaptive Evaluation Dimensions (Total Weight 30%)")
-    rubric_md_lines.append("")
+    # Render the complete rubric (fixed + adaptive + scoring rules) and persist the
+    # user-facing view. Deletion of rubric.md is harmless — it is rebuilt here each round.
+    rubric_text = _render_rubric_md(
+        rubric_config, dimensions, research_domain or rubric_config["primary_domain"]
+    )
+    shared_store.write_file(ASSESSMENT_RUBRIC, rubric_text)
+    cli.note(f"Rubric view rendered → {ASSESSMENT_RUBRIC}")
 
-    rubric_md_lines.append(rubric_config["dynamic_dimension_instructions"])
+    cli.info("Step 2/2: scoring ideas against the rubric")
 
-    # Provide domain context hints to help the Agent generate relevant dimensions
-    domain_context_hints = rubric_config.get("domain_context_hints", [])
-    if domain_context_hints:
-        rubric_md_lines.append("")
-        rubric_md_lines.append("### Domain Context (for reference)")
-        rubric_md_lines.append("")
-        for hint in domain_context_hints:
-            rubric_md_lines.append(f"- {hint}")
-
-    rubric_md_lines.extend([
-        "",
-        "## Scoring Rules",
-        "",
-        f"- Scoring range: {rubric_config['scoring_range']} per dimension",
-        "- Composite score = Σ(Fixed dimension score × weight) + Σ(Adaptive dimension score × weight)",
-        f"- Output Top {rubric_config['top_n']} ideas ranked by composite score",
-    ])
-
-    rubric_md_content = "\n".join(rubric_md_lines)
-    shared_store.write_file(ASSESSMENT_RUBRIC, rubric_md_content)
-    print(f"   >>> 📋 Rubric written to {ASSESSMENT_RUBRIC}")
-
-    # Build assessment prompt — instruct Agent to read rubric.md first
+    # Build assessment prompt (the rubric itself is injected via the system prompt)
     prompt_parts = []
 
     prompt_parts.append(f"# User's Research Question\n")
@@ -1008,16 +1375,65 @@ def run_assessment_node(state: ResearchState):
     prompt_parts.append("---\n")
 
     prompt_parts.append("## Assessment Instructions")
-    prompt_parts.append(f"The evaluation rubric has been prepared at `{ASSESSMENT_RUBRIC}`. You **MUST** first call `read_file(\"{ASSESSMENT_RUBRIC}\")` to load the complete rubric (including fixed dimensions, adaptive dimensions, weights, and scoring rules), then strictly follow it to evaluate the ideas.")
+    if human_feedback:
+        # Revision run: rubric is already finalized — no regeneration needed
+        prompt_parts.append(
+            "The finalized evaluation rubric is in your role instructions (<evaluation_dimensions>). Follow it for any re-evaluation the user feedback requires."
+        )
+    elif assessment_round > 1:
+        # Re-evaluation: reuse the Round-1 rubric so cross-round scores stay comparable
+        prompt_parts.append(
+            "The finalized evaluation rubric is in your role instructions (<evaluation_dimensions>). Strictly follow it for this re-evaluation. "
+            "Its dimensions must stay identical to Round 1 so score deltas remain comparable."
+        )
+    else:
+        prompt_parts.append(
+            "The evaluation rubric is in your role instructions (<evaluation_dimensions>). Strictly follow it to evaluate the ideas. "
+            "Do NOT regenerate or modify the dimensions — the rubric is fixed."
+        )
     prompt_parts.append("")
+    if human_feedback:
+        prompt_parts.append("## User Feedback Revision Task")
+        prompt_parts.append(f"> {human_feedback}")
+        prompt_parts.append(
+            "The user has reviewed your previous assessment and provided the feedback above. "
+            f"Read your current assessment from `{ASSESSMENT_FEEDBACK}` via `read_file`, then revise it per the feedback "
+            "(adjust scores, rewrite analyses, add new dimensions, or re-evaluate as requested), following the <iterative_refinement> guidance in your role instructions. "
+            f"Overwrite `{ASSESSMENT_FEEDBACK}` with the revised assessment. "
+            "The revised file MUST end with an updated `## Iteration Verdict` section (same structure as before) — the workflow parses it to decide the next step."
+        )
+        prompt_parts.append("")
+    if assessment_round > 1:
+        prompt_parts.append(f"## Re-evaluation Context (Round {assessment_round})")
+        prompt_parts.append(
+            f"This is assessment round {assessment_round}. Previous rounds' feedback has been archived in `{ASSESSMENT_ITERATION_HISTORY}`. "
+            f"You MUST read it via `read_file(\"{ASSESSMENT_ITERATION_HISTORY}\")` and perform a delta analysis: "
+            "verify which previous improvement priorities were addressed in the revised ideas (cite concrete changes), "
+            "which persist (diagnose why the previous revision was insufficient), "
+            "and whether any regressions or new issues were introduced. "
+            "Do NOT repeat earlier suggestions verbatim — deepen or redirect them."
+        )
+        prompt_parts.append("")
     prompt_parts.append("Please execute according to the assessment flow and output format defined in your role instructions.")
 
 
 
     prompt = "\n".join(prompt_parts)
 
+    # Build the Assessment Agent at runtime so the freshly rendered rubric
+    # (fixed + adaptive dimensions from source data) is injected into its system
+    # prompt via the {rubric_content} placeholder — agents built at import time
+    # cannot see dimensions that do not exist yet.
+    role_prompt = ASSESSMENT_AGENT_PROMPT.replace("{rubric_content}", rubric_text)
+    eval_agent = build_agent(
+        "Assessment Agent",
+        role_prompt,
+        tools=AGENT_BASE_TOOLS,
+        model=model_standard,
+    )
+
     assessment_response = invoke_agent_with_retry(
-        assessment_agent,
+        eval_agent,
         {"messages": [HumanMessage(content=prompt)]},
         config={"configurable": {"thread_id": "assess_thread"}},
         agent_name="Assessment Agent"
@@ -1036,13 +1452,16 @@ def run_assessment_node(state: ResearchState):
         "iteration": state.get("iteration_count", 0),
         "phase": "assessment",
         "rubric_domain": rubric_config["primary_domain"],
-        "dynamic_dimensions": "agent_generated",
+        "adaptive_dimensions": len(dimensions),
     }
 
     return {
         "completed_phase": "assessment",
         "current_phase": "assessment",
         "iteration_history": [iteration_record],
+        "human_feedback": None,
+        "rubric_dimensions": dimensions,
+        "rubric_research_domain": research_domain or rubric_config["primary_domain"],
     }
 
 # ==========================================
@@ -1054,9 +1473,10 @@ def run_report_node(state: ResearchState):
     Report generation phase node.
     Reads all phase data, writes to Outputs/Final_Report.md.
     """
-    print("\n--- 📝 Report generation phase (Report) ---")
+    cli.stage("STAGE 4/4 · Report", "final report generation")
 
     topic = state["topic"]
+    human_feedback = state.get("human_feedback")
     prompt_parts = []
     prompt_parts.append(f"# User's Original Research Requirement")
     prompt_parts.append(f"\n> {topic}")
@@ -1068,6 +1488,16 @@ def run_report_node(state: ResearchState):
     prompt_parts.append("1. **Survey Report**: `read_file(\"Survey/report.md\")`")
     prompt_parts.append("2. **Innovative Ideas**: `read_file(\"Innovation/ideas.md\")`")
     prompt_parts.append("")
+
+    if human_feedback:
+        prompt_parts.append("## User Feedback Revision Task")
+        prompt_parts.append(f"> {human_feedback}")
+        prompt_parts.append(
+            "The user has reviewed your draft report and provided the feedback above. "
+            f"Read your current report from `{OUTPUTS_FINAL_REPORT}` via `read_file`, then revise only the affected sections per the feedback "
+            "while maintaining overall coherence and quality, and overwrite the file with the revised report."
+        )
+        prompt_parts.append("")
     prompt_parts.append("Please generate the final research report based on the complete survey report and innovative ideas, following the report structure defined in your role instructions.")
     prompt_parts.append("**Important reminder**: The entire report MUST be written in English. The report body (excluding references) must be no less than 8,000 English words, and the 'Research Design and Methodology' chapter must be no less than 2,500 words. Please elaborate on the details of each technical approach. References must follow APA 7th edition format.")
 
@@ -1093,6 +1523,7 @@ def run_report_node(state: ResearchState):
         "messages": [HumanMessage(content="Report Generated")],
         "completed_phase": "report",
         "current_phase": "report",
+        "human_feedback": None,
     }
 
 # ==========================================
@@ -1102,8 +1533,8 @@ def run_report_node(state: ResearchState):
 def handle_file_upload() -> list:
     """Handle user file upload, save to Inputs/uploads/ directory"""
     uploaded_files = []
-    print("\n📁 File upload mode")
-    print("Please enter file paths to upload (one per line, empty line to finish):")
+    cli.section("File upload mode")
+    cli.info("Enter file paths to upload (one per line, empty line to finish)")
 
     while True:
         file_path = input("File path: ").strip()
@@ -1121,11 +1552,11 @@ def handle_file_upload() -> list:
                 shared_store.write_file(workspace_path, content)
 
                 uploaded_files.append(workspace_path)
-                print(f"   ✅ Uploaded: {file_path} -> {workspace_path}")
+                cli.ok(f"Uploaded: {file_path} → {workspace_path}")
             except Exception as error:
-                print(f"   ❌ Upload failed: {file_path} - {error}")
+                cli.error(f"Upload failed: {file_path} — {error}")
         else:
-            print(f"   ⚠️ File not found: {file_path}")
+            cli.warn(f"File not found: {file_path}")
 
     return uploaded_files
 
@@ -1144,7 +1575,7 @@ def human_review_node(state: ResearchState):
         max_iterations
     )
 
-    print(f"\n--- 👤 Waiting for user input ({pending_action}) ---")
+    cli.stage("Waiting for user input", str(pending_action))
     print(prompt)
 
     user_input = interrupt(prompt)
@@ -1197,9 +1628,9 @@ def analyze_user_feedback(state: ResearchState) -> PlanningDecision:
         max_iterations
     )
 
-    print(f"\n--- 🧠 Planning Agent (ReAct mode) ---")
+    cli.section("Planning Agent · ReAct mode")
     feedback_preview = human_feedback[:100] + "..." if len(human_feedback) > 100 else human_feedback
-    print(f"   User feedback: {feedback_preview}")
+    cli.kv("User feedback", feedback_preview)
 
     try:
         response = invoke_agent_with_retry(
@@ -1211,14 +1642,14 @@ def analyze_user_feedback(state: ResearchState) -> PlanningDecision:
 
         decision = parse_planning_decision(response)
 
-        print(f"   User intent: {decision.get('user_intent', 'unknown')}")
-        print(f"   Decision: {decision.get('next_action')}")
-        print(f"   Reasoning: {decision.get('reasoning', '')[:80]}")
+        cli.kv("User intent", str(decision.get('user_intent', 'unknown')))
+        cli.kv("Decision", str(decision.get('next_action')))
+        cli.kv("Reasoning", str(decision.get('reasoning', ''))[:80])
 
         return decision
 
     except Exception as error:
-        print(f"   ⚠️ Failed to parse decision: {error}")
+        cli.warn(f"Failed to parse decision: {error}")
         return get_default_decision(completed_phase, iteration_count, max_iterations)
 
 
@@ -1286,6 +1717,56 @@ def is_auto_mode_trigger(feedback: str) -> bool:
     return any(trigger in feedback_lower for trigger in AUTO_MODE_TRIGGERS)
 
 
+# ==========================================
+# Idea↔Assessment iteration verdict helpers
+# ==========================================
+
+def _parse_iteration_verdict() -> Optional[str]:
+    """
+    Parse the Iteration Verdict from the latest assessment_feedback.md.
+
+    Returns:
+        "CONVERGED", "NEEDS_ITERATION", or None if no explicit verdict is found.
+    """
+    import re
+    feedback = shared_store.read_file(ASSESSMENT_FEEDBACK)
+    if not feedback:
+        return None
+    # The verdict lives at the end of the file; earlier rounds may be quoted in delta
+    # analysis, so take the LAST match rather than the first.
+    matches = re.findall(r'status\*{0,2}\s*[:：]\s*\*{0,2}(CONVERGED|NEEDS_ITERATION)', feedback, re.IGNORECASE)
+    if matches:
+        return matches[-1].upper()
+    return None
+
+
+def _should_continue_idea_loop(idea_assessment_iters: int, max_iters: int):
+    """
+    Decide whether the Idea↔Assessment loop should run another round.
+
+    The decision is driven by the Assessment Agent's substance-based iteration
+    verdict (not scores): the loop continues only while substantive, actionable
+    issues remain and the iteration cap has not been reached.
+
+    Returns:
+        (should_loop: bool, reason: str)
+    """
+    feedback_exists = shared_store.read_file(ASSESSMENT_FEEDBACK) is not None
+    if not feedback_exists:
+        return False, "no assessment feedback"
+
+    if idea_assessment_iters >= max_iters:
+        return False, f"reached max Idea↔Assessment iterations ({max_iters})"
+
+    verdict = _parse_iteration_verdict()
+    if verdict == "CONVERGED":
+        return False, "assessment converged: no substantive issues remain"
+    if verdict == "NEEDS_ITERATION":
+        return True, "assessment verdict: substantive improvements remain"
+    # Fallback: no explicit verdict found, keep iterating while under the cap
+    return True, "no explicit iteration verdict, continuing iteration"
+
+
 def planning_node(state: ResearchState):
     """
     Core scheduler: use Planning Agent to intelligently analyze and decide next steps.
@@ -1304,12 +1785,11 @@ def planning_node(state: ResearchState):
     max_iterations = research_plan.get("max_iterations", 5) if research_plan else 5
 
     if auto_mode:
-        print(f"   🤖 Auto mode: enabled")
+        cli.note("Auto mode: enabled")
 
     # ========== Check if auto mode is triggered (from user feedback) ==========
     if human_feedback is not None and is_auto_mode_trigger(human_feedback):
-        print("   >>> 🤖 Auto mode trigger detected, enabling auto mode")
-        print("   >>> Subsequent flow will proceed automatically without asking user")
+        cli.note("Auto mode trigger detected — subsequent flow will proceed automatically")
         next_agent = get_next_agent_for_phase(completed_phase) if completed_phase else "Survey"
         return {
             "auto_mode": True,
@@ -1323,7 +1803,7 @@ def planning_node(state: ResearchState):
 
         # Check if topic contains auto mode trigger words
         if is_auto_mode_trigger(topic):
-            print("   >>> 🤖 Auto mode trigger detected in user topic, enabling auto mode")
+            cli.note("Auto mode trigger detected in user topic — enabling auto mode")
             auto_mode = True
 
         # Call Planning Agent to generate search plan
@@ -1349,7 +1829,7 @@ def planning_node(state: ResearchState):
     # If research plan not confirmed, wait for user confirmation (skipped in auto mode)
     if not plan_confirmed:
         if auto_mode:
-            print("   >>> 🤖 Auto mode: auto-confirming research plan")
+            cli.note("Auto mode: auto-confirming research plan")
             return {
                 "plan_confirmed": True,
                 "human_feedback": None,
@@ -1358,7 +1838,7 @@ def planning_node(state: ResearchState):
         if human_feedback is not None:
             feedback_lower = human_feedback.lower().strip()
             if feedback_lower == "":
-                print("   >>> ✅ User confirmed research plan (empty input)")
+                cli.ok("User confirmed research plan (empty input)")
                 return {
                     "plan_confirmed": True,
                     "human_feedback": None,
@@ -1367,14 +1847,14 @@ def planning_node(state: ResearchState):
             decision = analyze_user_feedback(state)
             user_intent = decision.get("user_intent", "continue")
             if user_intent in ("continue", "finish"):
-                print("   >>> ✅ User confirmed research plan")
+                cli.ok("User confirmed research plan")
                 return {
                     "plan_confirmed": True,
                     "human_feedback": None,
                     "next_agent": "Survey",
                 }
             else:
-                print("   >>> 🔄 User requested plan adjustment, regenerating search plan...")
+                cli.note("User requested plan adjustment — regenerating search plan")
                 init_result = _generate_search_plan(topic, user_feedback=human_feedback)
                 return {
                     "research_plan": init_result["research_plan"],
@@ -1392,7 +1872,7 @@ def planning_node(state: ResearchState):
     # ========== Handle pending human review (skipped in auto mode) ==========
     if pending_action:
         if auto_mode:
-            print(f"   >>> 🤖 Auto mode: skipping {pending_action}, continuing automatically")
+            cli.note(f"Auto mode: skipping {pending_action}, continuing automatically")
             next_agent = get_next_agent_for_phase(completed_phase or "")
             return {
                 "pending_human_action": None,
@@ -1406,11 +1886,11 @@ def planning_node(state: ResearchState):
 
         simple_continue_words = ['', 'continue', 'good', 'ok', 'okay', 'yes', 'sure', 'next', 'go ahead', 'proceed']
         if feedback_lower in simple_continue_words:
-            print(f"\n--- 🧠 Planning Agent (fast mode) ---")
-            print(f"   User feedback: {feedback_lower if feedback_lower else '(empty input)'}")
-            print(f"   User intent: continue")
+            cli.section("Planning Agent · fast mode")
+            cli.kv("User feedback", feedback_lower if feedback_lower else "(empty input)")
+            cli.kv("User intent", "continue")
             next_agent = get_next_agent_for_phase(completed_phase)
-            print(f"   Decision: {next_agent}")
+            cli.kv("Decision", next_agent)
             return {
                 "human_feedback": None,
                 "next_agent": next_agent,
@@ -1425,8 +1905,7 @@ def planning_node(state: ResearchState):
 
         # Planning Agent detected user wants auto mode
         if user_intent == "auto":
-            print("   >>> 🤖 Planning Agent detected auto mode intent, enabling auto mode")
-            print("   >>> Subsequent flow will proceed automatically without asking user")
+            cli.note("Planning Agent detected auto-mode intent — subsequent flow will proceed automatically")
             next_agent = get_next_agent_for_phase(completed_phase) if completed_phase else "Survey"
             return {
                 "auto_mode": True,
@@ -1444,7 +1923,7 @@ def planning_node(state: ResearchState):
             else:
                 # Fallback to default flow when next_action is invalid
                 next_agent = default_next
-            print(f"   >>> Next step: {next_agent}")
+            cli.info(f"Next step: {next_agent}")
             # If Planning Agent's decision differs from default flow (e.g., rollback to Survey), preserve original feedback
             return {
                 "human_feedback": human_feedback if next_agent != default_next else None,
@@ -1520,72 +1999,69 @@ def planning_node(state: ResearchState):
         next_agent = action_mapping.get(next_action)
 
         if next_agent:
+            # Pass the user's original feedback (not the Planning Agent's summary) to preserve details
             return {
                 "next_agent": next_agent,
-                "human_feedback": feedback_summary,
+                "human_feedback": human_feedback,
                 "focus_areas": focus_areas,
                 "planning_decision": decision,
             }
-    # Idea↔Assessment closed-loop iteration control (max 2 auto iterations)
+    # Idea↔Assessment closed-loop iteration control (verdict-driven, configurable cap)
     idea_assessment_iters = state.get("idea_assessment_iterations", 0)
-    max_idea_assessment_iters = 1
+    max_idea_assessment_iters = MAX_IDEA_ASSESSMENT_ITERS
 
     # Flow control in auto mode
     if auto_mode:
         if completed_phase == "assessment":
-            assessment_feedback_exists = shared_store.read_file(ASSESSMENT_FEEDBACK) is not None
-            if assessment_feedback_exists and idea_assessment_iters < max_idea_assessment_iters:
-                print(f"   >>> 🤖 Auto mode: assessment complete, entering feedback-driven iteration (Idea↔Assessment iter: {idea_assessment_iters + 1}/{max_idea_assessment_iters})")
+            should_loop, reason = _should_continue_idea_loop(idea_assessment_iters, max_idea_assessment_iters)
+            if should_loop:
+                cli.note(f"Auto mode: {reason} — entering feedback-driven iteration (Idea↔Assessment round {idea_assessment_iters + 1}/{max_idea_assessment_iters})")
                 return {
                     "next_agent": "Idea",
                     "idea_assessment_iterations": idea_assessment_iters + 1,
                 }
-            else:
-                reason = f"reached max Idea↔Assessment iterations ({max_idea_assessment_iters})" if idea_assessment_iters >= max_idea_assessment_iters else "no assessment feedback"
-                print(f"   >>> 🤖 Auto mode: assessment complete, {reason}, proceeding to Report")
-                return {
-                    "next_agent": "Report",
-                    "idea_assessment_iterations": 0,
-                }
+            cli.note(f"Auto mode: assessment complete ({reason}) — proceeding to Report")
+            return {
+                "next_agent": "Report",
+                "idea_assessment_iterations": 0,
+            }
         else:
             next_agent = get_next_agent_for_phase(completed_phase)
-            print(f"   >>> 🤖 Auto mode: {completed_phase} complete, proceeding to {next_agent}")
+            cli.note(f"Auto mode: {completed_phase} complete — proceeding to {next_agent}")
             return {"next_agent": next_agent}
 
-    # Non-auto mode: also auto-iterate after Assessment, hand to user review when limit reached
+    # Non-auto mode: verdict-driven auto-iteration after Assessment, hand to user review when converged or capped
     if completed_phase == "assessment":
-        assessment_feedback_exists = shared_store.read_file(ASSESSMENT_FEEDBACK) is not None
-        if assessment_feedback_exists and idea_assessment_iters < max_idea_assessment_iters:
-            print(f"   >>> ⚖️ Assessment complete, entering feedback-driven iterative optimization (Idea↔Assessment iter: {idea_assessment_iters + 1}/{max_idea_assessment_iters})")
+        should_loop, reason = _should_continue_idea_loop(idea_assessment_iters, max_idea_assessment_iters)
+        if should_loop:
+            cli.note(f"{reason} — entering feedback-driven iteration (Idea↔Assessment round {idea_assessment_iters + 1}/{max_idea_assessment_iters})")
             return {
                 "next_agent": "Idea",
                 "idea_assessment_iterations": idea_assessment_iters + 1,
             }
-        else:
-            reason = f"reached max Idea↔Assessment iterations ({max_idea_assessment_iters})" if idea_assessment_iters >= max_idea_assessment_iters else "no assessment feedback"
-            print(f"   >>> ⚖️ Assessment complete, {reason}, waiting for user confirmation")
-            return {
-                "next_agent": "HumanReview",
-                "pending_human_action": "assessment_review",
-                "idea_assessment_iterations": 0,
-            }
+        cli.ok(f"Assessment complete ({reason}) — waiting for user confirmation")
+        return {
+            "next_agent": "HumanReview",
+            "pending_human_action": "assessment_review",
+            "idea_assessment_iterations": 0,
+        }
 
     if completed_phase == "survey":
-        print("   >>> 📋 Survey complete, waiting for user confirmation...")
+        cli.ok("Survey complete — waiting for user confirmation")
         return {
             "next_agent": "HumanReview",
             "pending_human_action": "survey_review",
         }
 
     if completed_phase == "idea":
-        print("   >>> 💡 Ideation complete, waiting for user confirmation...")
+        cli.ok("Ideation complete — waiting for user confirmation")
         return {
             "next_agent": "HumanReview",
             "pending_human_action": "idea_review",
         }
 
     if completed_phase == "report":
-        print("   >>> 📝 Report generation complete, waiting for user review...")
+        cli.ok("Report complete — waiting for user review")
         return {
             "next_agent": "HumanReview",
             "pending_human_action": "report_review",

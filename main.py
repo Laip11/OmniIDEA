@@ -10,21 +10,20 @@ from langgraph.types import Command
 from graph import app, checkpointer
 from agents import shared_store
 from storage import OUTPUTS_FINAL_REPORT, PLANNING_GLOBAL_CONTEXT
+import cli
 
 
 def print_welcome_banner(query: str):
     """Print session welcome banner."""
-    print("\n" + "=" * 60)
-    print("OmniIDEA — Multi-Agent Research Workflow")
-    print("=" * 60)
-    print(f"Research topic: {query}")
-    print("-" * 60)
-    print("Pipeline: Survey → Idea → Assessment → Report")
-    print("Tip: ask to redo a phase (e.g. 'redo survey', 'regenerate ideas')")
-    print("-" * 60)
-    print("Provide feedback in natural language at each checkpoint.")
-    print("Exit anytime with: quit / exit / q")
-    print("=" * 60)
+    cli.banner(
+        "OmniIDEA — Multi-Agent Research Workflow",
+        [
+            ("Topic", query),
+            ("Pipeline", "Survey → Idea → Assessment → Report"),
+            ("Checkpoints", "natural-language feedback, e.g. 'redo survey', 'regenerate ideas'"),
+            ("Exit", "quit / exit / q anytime"),
+        ],
+    )
 
 
 def parse_cli_args(argv: list[str]) -> tuple[str, str]:
@@ -35,7 +34,7 @@ def parse_cli_args(argv: list[str]) -> tuple[str, str]:
     while i < len(argv):
         if argv[i] == "--thread":
             if i + 1 >= len(argv):
-                print("Error: --thread requires a session id.")
+                cli.error("--thread requires a session id")
                 sys.exit(1)
             thread_id = argv[i + 1]
             i += 2
@@ -70,17 +69,18 @@ def run_with_human_in_loop(query: str, thread_id: str = "main_thread"):
         "active_skill": None,
         "auto_mode": False,  # 自动模式：用户表示不想参与时启用
         "idea_assessment_iterations": 0,  # Idea↔Assessment 闭环迭代计数
+        "rubric_dimensions": None,  # Assessment rubric 动态维度源数据（首轮生成后填充）
+        "rubric_research_domain": None,  # Rubric Agent 修正后的领域描述
     }
 
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 100}
 
     print_welcome_banner(query)
-    print("🚀 系统启动...")
 
     # 打印可用 Skills
     available_skills = shared_store.list_skills()
     if available_skills:
-        print(f"   🎯 已加载 Skills: {', '.join(available_skills)}")
+        cli.info(f"Skills loaded: {', '.join(available_skills)}")
 
     # 记录初始 topic 的 memory 版本
     memory_version = shared_store.record_memory_version(
@@ -95,18 +95,18 @@ def run_with_human_in_loop(query: str, thread_id: str = "main_thread"):
     current_state = app.get_state(config)
 
     if current_state.values:
-        print("\n📂 检测到之前的运行状态，正在恢复...")
+        cli.section("Previous session detected — resuming")
         if current_state.next:
-            print(f"   当前等待节点: {current_state.next}")
+            cli.kv("Waiting node", str(current_state.next))
 
         values = current_state.values
         if values.get("research_plan"):
-            print(f"   研究计划: 已生成")
-            print(f"   计划确认: {'是' if values.get('plan_confirmed') else '否'}")
-        print(f"   迭代次数: {values.get('iteration_count', 0)}")
-        print(f"   当前阶段: {values.get('current_phase', '未开始')}")
+            cli.kv("Research plan", "generated")
+            cli.kv("Plan confirmed", "yes" if values.get("plan_confirmed") else "no")
+        cli.kv("Iterations", str(values.get("iteration_count", 0)))
+        cli.kv("Current phase", str(values.get("current_phase") or "not started"))
         if values.get("auto_mode"):
-            print(f"   🤖 自动模式: 已启用")
+            cli.kv("Auto mode", "enabled")
 
     input_state = initial_state if not current_state.values else None
 
@@ -121,10 +121,10 @@ def run_with_human_in_loop(query: str, thread_id: str = "main_thread"):
 
             if state.next:
                 if "HumanReview" in state.next:
-                    user_input = input("\n👤 您的输入: ").strip()
+                    user_input = input("\nYour input > ").strip()
 
                     if user_input.lower() in ['quit', 'exit', 'q']:
-                        print("\n👋 用户退出，流程终止。")
+                        cli.note("User quit — workflow terminated")
                         save_current_progress(state.values)
                         break
 
@@ -134,29 +134,27 @@ def run_with_human_in_loop(query: str, thread_id: str = "main_thread"):
                     input_state = None
                     continue
             else:
-                print("\n" + "=" * 60)
-                print("✅ 研究流程已完成！")
-                print("=" * 60)
+                cli.stage("Research workflow completed")
 
                 if state.values:
                     termination_reason = state.values.get("termination_reason")
                     if termination_reason:
                         reason_map = {
-                            "max_iterations": "达到最大迭代次数",
-                            "user_terminated": "用户主动终止",
+                            "max_iterations": "max iterations reached",
+                            "user_terminated": "terminated by user",
                         }
-                        print(f"📋 终止原因: {reason_map.get(termination_reason, termination_reason)}")
+                        cli.kv("Termination", reason_map.get(termination_reason, termination_reason))
                 break
 
         except KeyboardInterrupt:
-            print("\n\n⚠️ 检测到中断信号，正在保存进度...")
+            cli.warn("Interrupted — saving progress...")
             state = app.get_state(config)
             if state.values:
                 save_current_progress(state.values)
-            print("💾 进度已保存，下次运行时将自动恢复。")
+            cli.info("Progress saved; it will resume automatically on next run")
             break
         except Exception as error:
-            print(f"\n❌ 发生错误: {error}")
+            cli.error(f"Workflow error: {error}")
             import traceback
             traceback.print_exc()
             break
@@ -178,42 +176,38 @@ def save_current_progress(values: dict):
             PLANNING_GLOBAL_CONTEXT,
             json.dumps(progress, ensure_ascii=False, indent=2)
         )
-        print("💾 进度快照已保存")
+        cli.debug("Progress snapshot saved")
     except Exception as error:
-        print(f"⚠️ 保存进度失败: {error}")
+        cli.warn(f"Failed to save progress: {error}")
 
 
 def print_final_results():
     """打印最终结果"""
-    print("\n" + "=" * 60)
-    print("📊 研究成果汇总")
-    print("=" * 60)
+    cli.section("Research output summary")
 
     try:
         all_files = shared_store.list_files()
 
-        print(f"\n📁 Workspace 文件 ({len(all_files)} 个):")
+        cli.info(f"Workspace files ({len(all_files)}):")
         for file_path in sorted(all_files):
-            print(f"   • {file_path}")
+            print(f"    - {file_path}")
 
         workspace_dir = shared_store.get_workspace_dir()
-        print(f"\n💾 Workspace 目录: {workspace_dir}")
+        cli.kv("Workspace dir", workspace_dir)
 
         # 尝试读取最终报告
         final_report = shared_store.read_file(OUTPUTS_FINAL_REPORT)
         if final_report:
-            print("\n" + "=" * 60)
-            print("📝 最终报告预览 (前 500 字符):")
-            print("=" * 60)
+            cli.section("Final report preview (first 500 chars)")
             preview = final_report[:500] + "..." if len(final_report) > 500 else final_report
             print(preview)
-            print("=" * 60)
-            print(f"📄 完整报告请查看: {os.path.join(workspace_dir, OUTPUTS_FINAL_REPORT)}")
+            cli.rule("=")
+            cli.ok(f"Full report: {os.path.join(workspace_dir, OUTPUTS_FINAL_REPORT)}")
         else:
-            print("\n⚠️ 未找到最终报告文件")
+            cli.warn("Final report not found")
 
     except Exception as error:
-        print(f"⚠️ 读取结果时出错: {error}")
+        cli.warn(f"Failed to read results: {error}")
 
 def main():
     """CLI entry point."""
@@ -221,8 +215,7 @@ def main():
 
     if not query:
         print("OmniIDEA — Multi-Agent Research Workflow")
-        print("Enter your research question:")
-        query = input("> ").strip()
+        query = input("Enter your research question > ").strip()
 
     if not query:
         print("\nUsage:")

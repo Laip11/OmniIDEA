@@ -33,7 +33,7 @@ The report must follow this structure in order:
 - In-text citations use numbered brackets: `[1]`, `[2, 5]`, `[3-7]`
 - Every `[x]` in the text must have a corresponding entry in References
 - No reference entry should be orphaned (unused in text)
-- References must come exclusively from `Inputs/raw/collected_papers.md`
+- References must come from the survey report (`Survey/report.md`) and research data gathered during the survey phase
 - Never fabricate references
 
 ### 3. Formula Formatting
